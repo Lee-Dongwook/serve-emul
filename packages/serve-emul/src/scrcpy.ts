@@ -1,9 +1,13 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createConnection, type Socket } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
+import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { SCRCPY_VERSION, ensureScrcpyServer } from "../scripts/fetch-scrcpy.ts";
+import { execText } from "./exec.ts";
 
-const DEVICE_JAR_PATH = "/data/local/tmp/scrcpy-server.jar";
+const DEVICE_JAR_CACHE_PATH =
+  `/data/local/tmp/serve-emul-scrcpy-server-v${SCRCPY_VERSION}.jar`;
 
 export type ScrcpyMeta = {
   deviceName: string;
@@ -25,17 +29,90 @@ export type ScrcpySession = {
   localPort: number;
   serial: string;
   readFrame: () => Promise<VideoPacket | null>;
-  close: () => void;
+  close: () => Promise<void>;
 };
+
+export type ScrcpyErrorCode =
+  | "clean-eof"
+  | "truncated-header"
+  | "truncated-payload"
+  | "invalid-frame-size"
+  | "reader-overflow"
+  | "unsupported-codec"
+  | "protocol-parse"
+  | "socket-error";
 
 export type StartOpts = {
   serial: string;
+  signal?: AbortSignal;
   maxFps?: number;
   bitRate?: number;
   maxSize?: number;
   keyFrameInterval?: number;
   repeatFrameMs?: number;
 };
+
+export type AdbCommandResult = {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut?: boolean;
+  error?: Error | null;
+};
+
+export type ScrcpyRuntime = {
+  ensureServer: () => Promise<string>;
+  serverFingerprint: (path: string) => Promise<string>;
+  runAdb: (
+    serial: string,
+    args: string[],
+    opts: { timeoutMs: number; signal: AbortSignal },
+  ) => Promise<AdbCommandResult>;
+  spawnAdb: (serial: string, args: string[]) => ChildProcess;
+  connect: (
+    port: number,
+    timeoutMs: number,
+    signal: AbortSignal,
+  ) => Promise<Socket>;
+  sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+  randomScid: () => string;
+  pickPort: () => number;
+  setTimer: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
+};
+
+export type ScrcpyTimeouts = {
+  pushMs: number;
+  copyMs: number;
+  forwardMs: number;
+  socketPollMs: number;
+  socketReadyMs: number;
+  connectMs: number;
+  preambleMs: number;
+  processExitMs: number;
+  cleanupMs: number;
+};
+
+export type ScrcpyDependencies = Partial<ScrcpyRuntime> & {
+  timeouts?: Partial<ScrcpyTimeouts>;
+};
+
+const DEFAULT_TIMEOUTS: ScrcpyTimeouts = {
+  pushMs: 30_000,
+  copyMs: 5_000,
+  forwardMs: 5_000,
+  socketPollMs: 2_000,
+  socketReadyMs: 30_000,
+  connectMs: 3_000,
+  preambleMs: 10_000,
+  processExitMs: 1_000,
+  cleanupMs: 3_000,
+};
+
+// exec.ts holds its concurrency slot for up to one second while reaping a
+// process killed by AbortSignal. Wait slightly longer before starting cleanup
+// so an outcome-ambiguous ADB mutation cannot complete after rollback.
+const ADB_CANCELLATION_SETTLE_MS = 1_100;
 
 // Single source of truth for encoder defaults; the CLI reads these for its
 // option defaults and --help text so the two can't drift.
@@ -69,57 +146,8 @@ export type VideoSession = {
 
 export type VideoPacket = VideoFrame | VideoSession;
 
-function adb(serial: string, args: string[]) {
-  const r = spawnSync("adb", ["-s", serial, ...args], { encoding: "utf8" });
-  if (r.status !== 0)
-    throw new Error(`adb -s ${serial} ${args.join(" ")} failed: ${r.stderr}`);
-  return r.stdout;
-}
-
 function pickPort(): number {
   return 27200 + Math.floor(Math.random() * 2000);
-}
-
-function removeForward(serial: string, port: number): void {
-  const r = spawnSync("adb", ["-s", serial, "forward", "--remove", `tcp:${port}`], {
-    encoding: "utf8",
-  });
-  if (r.status !== 0 && !r.stderr.includes("cannot remove listener")) {
-    throw new Error(`adb -s ${serial} forward --remove tcp:${port} failed: ${r.stderr}`);
-  }
-}
-
-function forwardedPort(serial: string, target: string): number | null {
-  const r = spawnSync("adb", ["-s", serial, "forward", "--list"], { encoding: "utf8" });
-  if (r.status !== 0) return null;
-  for (const line of r.stdout.split("\n")) {
-    const match = line.match(/^(\S+)\s+tcp:(\d+)\s+(.+)$/);
-    if (!match) continue;
-    if (match[1] === serial && match[3] === target) return Number(match[2]);
-  }
-  return null;
-}
-
-function forwardAbstractSocket(serial: string, scid: string): number {
-  const target = `localabstract:scrcpy_${scid}`;
-  const dynamic = spawnSync("adb", ["-s", serial, "forward", "tcp:0", target], {
-    encoding: "utf8",
-  });
-  if (dynamic.status === 0) {
-    const port = Number(dynamic.stdout.trim()) || forwardedPort(serial, target);
-    if (port && Number.isInteger(port)) return port;
-  }
-
-  let lastError = dynamic.stderr.trim() || "adb did not return a forwarded port";
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const port = pickPort();
-    const fixed = spawnSync("adb", ["-s", serial, "forward", `tcp:${port}`, target], {
-      encoding: "utf8",
-    });
-    if (fixed.status === 0) return port;
-    lastError = fixed.stderr.trim() || lastError;
-  }
-  throw new Error(`Failed to create adb forward for ${target}: ${lastError}`);
 }
 
 function randomScid(): string {
@@ -130,41 +158,508 @@ function randomScid(): string {
     .padStart(8, "0");
 }
 
+function abortError(signal: AbortSignal, fallback: string): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error(fallback);
+}
+
+function throwIfAborted(signal: AbortSignal, fallback: string): void {
+  if (signal.aborted) throw abortError(signal, fallback);
+}
+
+function runtimeFor(deps: ScrcpyDependencies): ScrcpyRuntime {
+  return {
+    ensureServer: deps.ensureServer ?? ensureScrcpyServer,
+    serverFingerprint:
+      deps.serverFingerprint ??
+      (async (path) =>
+        createHash("sha256").update(await readFile(path)).digest("hex")),
+    runAdb:
+      deps.runAdb ??
+      (async (serial, args, opts) =>
+        execText("adb", ["-s", serial, ...args], {
+          timeout: opts.timeoutMs,
+          signal: opts.signal,
+        })),
+    spawnAdb:
+      deps.spawnAdb ??
+      ((serial, args) =>
+        spawn("adb", ["-s", serial, ...args], {
+          stdio: ["ignore", "pipe", "pipe"],
+        })),
+    connect: deps.connect ?? connectOnce,
+    sleep:
+      deps.sleep ??
+      ((ms, signal) => sleep(ms, undefined, { signal })),
+    randomScid: deps.randomScid ?? randomScid,
+    pickPort: deps.pickPort ?? pickPort,
+    setTimer: deps.setTimer ?? ((callback, ms) => setTimeout(callback, ms)),
+    clearTimer: deps.clearTimer ?? ((timer) => clearTimeout(timer)),
+  };
+}
+
+async function withDeadline<T>(
+  runtime: ScrcpyRuntime,
+  parentSignal: AbortSignal | undefined,
+  timeoutMs: number,
+  label: string,
+  operation: (signal: AbortSignal) => Promise<T>,
+  settleAfterAbortMs = 0,
+): Promise<T> {
+  const controller = new AbortController();
+  const abortFromParent = () =>
+    controller.abort(abortError(parentSignal!, `${label} aborted`));
+  parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  if (parentSignal?.aborted) abortFromParent();
+  const timer = runtime.setTimer(
+    () => controller.abort(new Error(`${label} timed out after ${timeoutMs}ms`)),
+    timeoutMs,
+  );
+
+  try {
+    throwIfAborted(controller.signal, `${label} aborted`);
+    const operationPromise = Promise.resolve().then(() =>
+      operation(controller.signal),
+    );
+    const aborted = new Promise<never>((_resolve, reject) => {
+      const onAbort = () =>
+        reject(abortError(controller.signal, `${label} aborted`));
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      operationPromise.then(
+        () => controller.signal.removeEventListener("abort", onAbort),
+        () => controller.signal.removeEventListener("abort", onAbort),
+      );
+      if (controller.signal.aborted) onAbort();
+    });
+
+    try {
+      return await Promise.race([operationPromise, aborted]);
+    } catch (err) {
+      if (controller.signal.aborted && settleAfterAbortMs > 0) {
+        let settleTimer: ReturnType<typeof setTimeout> | null = null;
+        await Promise.race([
+          operationPromise.then(
+            () => undefined,
+            () => undefined,
+          ),
+          new Promise<void>((resolve) => {
+            settleTimer = runtime.setTimer(resolve, settleAfterAbortMs);
+          }),
+        ]);
+        if (settleTimer) runtime.clearTimer(settleTimer);
+        throw abortError(controller.signal, `${label} aborted`);
+      }
+      throw err;
+    }
+  } finally {
+    runtime.clearTimer(timer);
+    parentSignal?.removeEventListener("abort", abortFromParent);
+  }
+}
+
+function commandFailure(
+  serial: string,
+  args: string[],
+  result: AdbCommandResult,
+): Error {
+  const detail =
+    result.stderr?.trim() ||
+    result.stdout?.trim() ||
+    result.error?.message ||
+    (result.timedOut ? "timed out" : `status ${result.status}`);
+  return new Error(`adb -s ${serial} ${args.join(" ")} failed: ${detail}`);
+}
+
+function deviceUnavailable(result: AdbCommandResult): boolean {
+  const detail = `${result.stderr ?? ""} ${result.stdout ?? ""}`;
+  return /\b(?:device offline|device .* not found|no devices?|closed)\b/i.test(
+    detail,
+  );
+}
+
+async function runAdbRaw(
+  runtime: ScrcpyRuntime,
+  serial: string,
+  args: string[],
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<AdbCommandResult> {
+  return withDeadline(
+    runtime,
+    signal,
+    timeoutMs,
+    `adb ${args.join(" ")}`,
+    (commandSignal) =>
+      runtime.runAdb(serial, args, { timeoutMs, signal: commandSignal }),
+    ADB_CANCELLATION_SETTLE_MS,
+  );
+}
+
+async function runAdbChecked(
+  runtime: ScrcpyRuntime,
+  serial: string,
+  args: string[],
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const result = await runAdbRaw(runtime, serial, args, timeoutMs, signal);
+  if (result.status !== 0) throw commandFailure(serial, args, result);
+  return result.stdout;
+}
+
+function forwardedPorts(
+  output: string,
+  serial: string,
+  target: string,
+): number[] {
+  const ports: number[] = [];
+  for (const line of output.split("\n")) {
+    const match = line.match(/^(\S+)\s+tcp:(\d+)\s+(.+)$/);
+    if (match?.[1] === serial && match[3] === target) {
+      ports.push(Number(match[2]));
+    }
+  }
+  return ports;
+}
+
+async function forwardAbstractSocket(
+  runtime: ScrcpyRuntime,
+  timeouts: ScrcpyTimeouts,
+  serial: string,
+  target: string,
+  signal: AbortSignal,
+): Promise<number> {
+  const dynamicArgs = ["forward", "tcp:0", target];
+  const dynamic = await runAdbRaw(
+    runtime,
+    serial,
+    dynamicArgs,
+    timeouts.forwardMs,
+    signal,
+  );
+  if (dynamic.status === 0) {
+    const direct = Number(dynamic.stdout.trim());
+    if (Number.isInteger(direct) && direct > 0) return direct;
+    const listed = await runAdbRaw(
+      runtime,
+      serial,
+      ["forward", "--list"],
+      timeouts.forwardMs,
+      signal,
+    );
+    if (listed.status === 0) {
+      const [port] = forwardedPorts(listed.stdout, serial, target);
+      if (port) return port;
+    }
+  }
+
+  let lastError =
+    dynamic.stderr?.trim() ||
+    dynamic.error?.message ||
+    "adb did not return a forwarded port";
+  for (let attempt = 0; attempt < 5; attempt++) {
+    throwIfAborted(signal, "adb forward aborted");
+    const port = runtime.pickPort();
+    const fixedArgs = [
+      "forward",
+      "--no-rebind",
+      `tcp:${port}`,
+      target,
+    ];
+    const fixed = await runAdbRaw(
+      runtime,
+      serial,
+      fixedArgs,
+      timeouts.forwardMs,
+      signal,
+    );
+    if (fixed.status === 0) return port;
+    lastError = fixed.stderr?.trim() || fixed.error?.message || lastError;
+  }
+  throw new Error(`Failed to create adb forward for ${target}: ${lastError}`);
+}
+
+async function removeForwards(
+  runtime: ScrcpyRuntime,
+  timeouts: ScrcpyTimeouts,
+  serial: string,
+  target: string,
+  knownPort: number | null,
+): Promise<void> {
+  const cleanupController = new AbortController();
+  const ports = new Set<number>(knownPort === null ? [] : [knownPort]);
+  const errors: unknown[] = [];
+  try {
+    const listed = await runAdbRaw(
+      runtime,
+      serial,
+      ["forward", "--list"],
+      timeouts.cleanupMs,
+      cleanupController.signal,
+    );
+    if (listed.status === 0) {
+      for (const port of forwardedPorts(listed.stdout, serial, target)) {
+        ports.add(port);
+      }
+    } else if (!deviceUnavailable(listed)) {
+      errors.push(
+        commandFailure(serial, ["forward", "--list"], listed),
+      );
+    }
+  } catch (err) {
+    errors.push(err);
+  }
+
+  const removals = await Promise.allSettled(
+    Array.from(ports, async (port) => {
+      const args = ["forward", "--remove", `tcp:${port}`];
+      const result = await runAdbRaw(
+        runtime,
+        serial,
+        args,
+        timeouts.cleanupMs,
+        cleanupController.signal,
+      );
+      if (
+        result.status !== 0 &&
+        !deviceUnavailable(result) &&
+        !/(?:cannot remove listener|listener .* not found)/i.test(
+          result.stderr ?? "",
+        )
+      ) {
+        throw commandFailure(serial, args, result);
+      }
+    }),
+  );
+  for (const removal of removals) {
+    if (removal.status === "rejected") errors.push(removal.reason);
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(
+      errors,
+      `Failed to remove adb forwards for ${target}`,
+    );
+  }
+}
+
+type DeviceJarPaths = {
+  cache: string;
+  temporary: string;
+  working: string;
+};
+
+async function prepareDeviceServerJar(
+  runtime: ScrcpyRuntime,
+  timeouts: ScrcpyTimeouts,
+  serial: string,
+  localJar: string,
+  paths: DeviceJarPaths,
+  signal: AbortSignal,
+): Promise<void> {
+  const probe = await runAdbRaw(
+    runtime,
+    serial,
+    ["shell", "test", "-f", paths.cache],
+    timeouts.copyMs,
+    signal,
+  );
+  if (probe.status !== 0) {
+    await runAdbChecked(
+      runtime,
+      serial,
+      ["push", localJar, paths.temporary],
+      timeouts.pushMs,
+      signal,
+    );
+    await runAdbChecked(
+      runtime,
+      serial,
+      ["shell", "mv", paths.temporary, paths.cache],
+      timeouts.copyMs,
+      signal,
+    );
+  }
+  await runAdbChecked(
+    runtime,
+    serial,
+    ["shell", "cp", paths.cache, paths.working],
+    timeouts.copyMs,
+    signal,
+  );
+}
+
+async function removeWorkingJars(
+  runtime: ScrcpyRuntime,
+  timeouts: ScrcpyTimeouts,
+  serial: string,
+  paths: DeviceJarPaths,
+): Promise<void> {
+  const cleanupController = new AbortController();
+  const args = ["shell", "rm", "-f", paths.temporary, paths.working];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await runAdbRaw(
+      runtime,
+      serial,
+      args,
+      timeouts.cleanupMs,
+      cleanupController.signal,
+    );
+    if (result.status === 0) return;
+    // ADB occasionally closes the first shell channel immediately after the
+    // long-running app_process channel exits. `rm -f` is idempotent, so retry
+    // once to distinguish that transport race from a real cleanup failure.
+    if (attempt === 0 && /\bclosed\b/i.test(result.stderr ?? "")) {
+      await runtime.sleep(100, cleanupController.signal);
+      continue;
+    }
+    if (deviceUnavailable(result)) return;
+    throw commandFailure(serial, args, result);
+  }
+}
+
+async function waitForAbstractSocketAsync(
+  runtime: ScrcpyRuntime,
+  timeouts: ScrcpyTimeouts,
+  serial: string,
+  name: string,
+  signal: AbortSignal,
+): Promise<void> {
+  while (true) {
+    throwIfAborted(signal, `waiting for @${name} aborted`);
+    const result = await runAdbRaw(
+      runtime,
+      serial,
+      ["shell", "cat", "/proc/net/unix"],
+      timeouts.socketPollMs,
+      signal,
+    );
+    if (result.status === 0 && result.stdout.includes(`@${name}`)) return;
+    const detail = `${result.stderr ?? ""} ${result.stdout ?? ""}`;
+    if (/\b(offline|unauthorized|not found|no devices?)\b/i.test(detail)) {
+      throw commandFailure(
+        serial,
+        ["shell", "cat", "/proc/net/unix"],
+        result,
+      );
+    }
+    await runtime.sleep(100, signal);
+  }
+}
+
 const MAX_READER_BUFFER_BYTES = 32 * 1024 * 1024;
 
-class FramedReader {
+type ReadKind = "header" | "payload";
+
+export class ScrcpyStreamError extends Error {
+  constructor(
+    readonly code: ScrcpyErrorCode,
+    message: string,
+    readonly meta?: Record<string, string | number>,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "ScrcpyStreamError";
+  }
+}
+
+export class FramedReader {
   private chunks: Buffer[] = [];
   private firstChunkOffset = 0;
   private total = 0;
-  private waiters: { n: number; resolve: (b: Buffer) => void; reject: (e: Error) => void }[] = [];
-  private err: Error | null = null;
+  private waiters: {
+    n: number;
+    kind: ReadKind;
+    resolve: (b: Buffer) => void;
+    reject: (e: Error) => void;
+  }[] = [];
+  private err: ScrcpyStreamError | null = null;
+  private ended = false;
 
   constructor(public readonly sock: Socket) {
     sock.on("data", (d: Buffer) => {
       if (this.total + d.length > MAX_READER_BUFFER_BYTES) {
-        this.err = new Error("scrcpy video reader buffer overflow");
-        while (this.waiters.length) this.waiters.shift()!.reject(this.err);
-        this.chunks.length = 0;
-        this.total = 0;
+        this.fail(
+          new ScrcpyStreamError(
+            "reader-overflow",
+            `scrcpy video reader buffer overflow (> ${MAX_READER_BUFFER_BYTES} bytes)`,
+            { limit: MAX_READER_BUFFER_BYTES },
+          ),
+        );
         return;
       }
       this.chunks.push(d);
       this.total += d.length;
       this.flush();
     });
-    const fail = (e: Error) => {
-      this.err = e;
-      while (this.waiters.length) this.waiters.shift()!.reject(e);
-    };
-    sock.on("error", fail);
-    sock.on("end", () => fail(new Error("scrcpy video socket ended")));
-    sock.on("close", () => fail(new Error("scrcpy video socket closed")));
+    sock.on("error", (e: Error) =>
+      this.fail(
+        new ScrcpyStreamError(
+          "socket-error",
+          `scrcpy video socket error: ${e.message}`,
+          undefined,
+          { cause: e },
+        ),
+      ),
+    );
+    sock.on("end", () => this.endStream());
+    sock.on("close", () => this.endStream());
   }
 
-  read(n: number): Promise<Buffer> {
+  // Terminal failure: record the first cause, reject pending reads, drop the
+  // buffer, and destroy the socket so no further data can accumulate.
+  private fail(e: ScrcpyStreamError) {
+    if (this.err) return;
+    this.err = e;
+    this.chunks.length = 0;
+    this.firstChunkOffset = 0;
+    this.total = 0;
+    while (this.waiters.length) this.waiters.shift()!.reject(e);
+    try {
+      this.sock.destroy();
+    } catch {}
+  }
+
+  // Socket end/close. A pending header read with an empty buffer is a clean
+  // frame-boundary EOF; anything else means the stream was cut mid-packet.
+  private endStream() {
+    if (this.err || this.ended) return;
+    this.ended = true;
+    while (this.waiters.length) {
+      const w = this.waiters.shift()!;
+      const clean = w.kind === "header" && this.total === 0;
+      w.reject(
+        clean
+          ? new ScrcpyStreamError(
+              "clean-eof",
+              "scrcpy video stream ended cleanly",
+            )
+          : new ScrcpyStreamError(
+              w.kind === "header" ? "truncated-header" : "truncated-payload",
+              `scrcpy stream ended mid-${w.kind} (needed ${w.n}, had ${this.total})`,
+              { needed: w.n, had: this.total },
+            ),
+      );
+    }
+  }
+
+  read(n: number, kind: ReadKind): Promise<Buffer> {
     if (this.err) return Promise.reject(this.err);
+    if (this.ended && this.total < n) {
+      const clean = kind === "header" && this.total === 0;
+      return Promise.reject(
+        clean
+          ? new ScrcpyStreamError(
+              "clean-eof",
+              "scrcpy video stream ended cleanly",
+            )
+          : new ScrcpyStreamError(
+              kind === "header" ? "truncated-header" : "truncated-payload",
+              `scrcpy stream ended mid-${kind} (needed ${n}, had ${this.total})`,
+              { needed: n, had: this.total },
+            ),
+      );
+    }
     return new Promise((resolve, reject) => {
-      this.waiters.push({ n, resolve, reject });
+      this.waiters.push({ n, kind, resolve, reject });
       this.flush();
     });
   }
@@ -184,7 +679,10 @@ class FramedReader {
     const first = this.chunks[0];
     const firstAvailable = first.length - this.firstChunkOffset;
     if (firstAvailable >= n) {
-      const out = first.subarray(this.firstChunkOffset, this.firstChunkOffset + n);
+      const out = first.subarray(
+        this.firstChunkOffset,
+        this.firstChunkOffset + n,
+      );
       this.firstChunkOffset += n;
       this.total -= n;
       if (this.firstChunkOffset === first.length) {
@@ -200,7 +698,12 @@ class FramedReader {
       const chunk = this.chunks[0];
       const available = chunk.length - this.firstChunkOffset;
       const take = Math.min(n - written, available);
-      chunk.copy(out, written, this.firstChunkOffset, this.firstChunkOffset + take);
+      chunk.copy(
+        out,
+        written,
+        this.firstChunkOffset,
+        this.firstChunkOffset + take,
+      );
       written += take;
       this.firstChunkOffset += take;
       this.total -= take;
@@ -220,37 +723,86 @@ class FramedReader {
   }
 }
 
-async function waitForAbstractSocket(serial: string, name: string, timeoutMs = 30_000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const r = spawnSync("adb", ["-s", serial, "shell", "cat", "/proc/net/unix"], {
-      encoding: "utf8",
-    });
-    if (r.stdout && r.stdout.includes(`@${name}`)) return;
-    await sleep(100);
+export function parseFrameHeader(
+  header: Buffer,
+  protocol: ScrcpyProtocol,
+):
+  | { kind: "session"; width: number; height: number; clientResized: boolean }
+  | {
+      kind: "frame";
+      size: number;
+      pts: bigint;
+      isConfig: boolean;
+      isKey: boolean;
+    } {
+  const ptsRaw = header.readBigUInt64BE(0);
+  if (protocol === 4 && (ptsRaw & PACKET_V4_FLAG_SESSION) !== 0n) {
+    return {
+      kind: "session",
+      clientResized: (header.readUInt32BE(0) & 1) !== 0,
+      width: header.readUInt32BE(4),
+      height: header.readUInt32BE(8),
+    };
   }
-  throw new Error(`Timed out waiting for scrcpy abstract socket @${name}`);
+  const size = header.readUInt32BE(8);
+  if (size === 0 || size > 16 * 1024 * 1024) {
+    throw new ScrcpyStreamError(
+      "invalid-frame-size",
+      `invalid scrcpy frame size: ${size}`,
+      { size },
+    );
+  }
+  const isConfig =
+    protocol === 4
+      ? (ptsRaw & PACKET_V4_FLAG_CONFIG) !== 0n
+      : (ptsRaw & PACKET_FLAG_CONFIG) !== 0n;
+  const isKey =
+    protocol === 4
+      ? (ptsRaw & PACKET_V4_FLAG_KEY_FRAME) !== 0n
+      : (ptsRaw & PACKET_FLAG_KEY_FRAME) !== 0n;
+  const pts = ptsRaw & ~(protocol === 4 ? PACKET_V4_FLAGS : PACKET_V3_FLAGS);
+  return { kind: "frame", size, pts, isConfig, isKey };
 }
 
-async function connectOnce(port: number, timeoutMs = 3_000): Promise<Socket> {
+async function connectOnce(
+  port: number,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<Socket> {
   return new Promise<Socket>((resolve, reject) => {
     const s = createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", onAbort);
+      s.removeListener("error", onError);
+      s.removeListener("connect", onConnect);
+      callback();
+    };
     const timeout = setTimeout(() => {
-      s.destroy();
-      reject(new Error(`Timed out connecting to adb forward tcp:${port}`));
+      finish(() => {
+        s.destroy();
+        reject(new Error(`Timed out connecting to adb forward tcp:${port}`));
+      });
     }, timeoutMs);
     const onError = (e: Error) => {
-      clearTimeout(timeout);
-      s.removeListener("connect", onConnect);
-      reject(e);
+      finish(() => reject(e));
     };
     const onConnect = () => {
-      clearTimeout(timeout);
-      s.removeListener("error", onError);
-      resolve(s);
+      finish(() => resolve(s));
+    };
+    const onAbort = () => {
+      finish(() => {
+        s.destroy();
+        reject(abortError(signal, "scrcpy socket connection aborted"));
+      });
     };
     s.once("error", onError);
     s.once("connect", onConnect);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
   });
 }
 
@@ -260,7 +812,7 @@ const CODEC_NAMES: Record<number, string> = {
   0x00617631: "av1",
 };
 
-function parseVideoPreamble(buf: Buffer): {
+export function parseVideoPreamble(buf: Buffer): {
   deviceName: string;
   codecName: string;
   width: number;
@@ -303,7 +855,14 @@ function parseVideoPreamble(buf: Buffer): {
     const width = buf.readUInt32BE(streamMetaOffset + 4);
     const height = buf.readUInt32BE(streamMetaOffset + 8);
     const codecName = CODEC_NAMES[codecId];
-    if (!codecName || width < 1 || height < 1 || width > 16_384 || height > 16_384) continue;
+    if (
+      !codecName ||
+      width < 1 ||
+      height < 1 ||
+      width > 16_384 ||
+      height > 16_384
+    )
+      continue;
 
     const nameBuf = buf.subarray(offset, offset + 64);
     const deviceName = nameBuf.toString("utf8").replace(/\0+$/, "");
@@ -317,32 +876,62 @@ function parseVideoPreamble(buf: Buffer): {
     };
   }
 
-  throw new Error(`Could not parse scrcpy video preamble: ${buf.toString("hex", 0, 24)}...`);
+  throw new ScrcpyStreamError(
+    "protocol-parse",
+    `Could not parse scrcpy video preamble: ${buf.toString("hex", 0, 24)}...`,
+    { head: buf.toString("hex", 0, 24) },
+  );
 }
 
-export async function startScrcpy(opts: StartOpts): Promise<ScrcpySession> {
-  const jar = await ensureScrcpyServer();
+export async function startScrcpy(
+  opts: StartOpts,
+  deps: ScrcpyDependencies = {},
+): Promise<ScrcpySession> {
+  const runtime = runtimeFor(deps);
+  const timeouts = { ...DEFAULT_TIMEOUTS, ...deps.timeouts };
   const { serial } = opts;
   const maxFps = opts.maxFps ?? SCRCPY_DEFAULTS.maxFps;
   const bitRate = opts.bitRate ?? SCRCPY_DEFAULTS.bitRate;
   const maxSize = opts.maxSize ?? SCRCPY_DEFAULTS.maxSize;
-  const keyFrameInterval = opts.keyFrameInterval ?? SCRCPY_DEFAULTS.keyFrameInterval;
+  const keyFrameInterval =
+    opts.keyFrameInterval ?? SCRCPY_DEFAULTS.keyFrameInterval;
   const repeatFrameMs = opts.repeatFrameMs ?? SCRCPY_DEFAULTS.repeatFrameMs;
-  // MediaCodec option types matter: repeat-previous-frame-after is a long (µs).
   const codecOptions = [
     ...(keyFrameInterval > 0 ? [`i-frame-interval=${keyFrameInterval}`] : []),
-    ...(repeatFrameMs > 0 ? [`repeat-previous-frame-after:long=${Math.round(repeatFrameMs * 1000)}`] : []),
+    ...(repeatFrameMs > 0
+      ? [`repeat-previous-frame-after:long=${Math.round(repeatFrameMs * 1000)}`]
+      : []),
   ];
-  const scid = randomScid();
+  const scid = runtime.randomScid();
+  const forwardTarget = `localabstract:scrcpy_${scid}`;
+  const startupController = new AbortController();
+  let startupComplete = false;
+  let jarPreparationStarted = false;
+  let forwardAttempted = false;
+  let jarPaths: DeviceJarPaths | null = null;
   let localPort: number | null = null;
   let proc: ChildProcess | null = null;
+  let childSettled = true;
+  let childDone: Promise<void> = Promise.resolve();
   let videoSock: Socket | null = null;
   let controlSock: Socket | null = null;
-  let closed = false;
+  let closeTask: Promise<void> | null = null;
+  let closeWithReason!: (reason: Error) => Promise<void>;
 
-  const close = () => {
-    if (closed) return;
-    closed = true;
+  const externalAbort = () => {
+    const reason = abortError(opts.signal!, "scrcpy startup aborted");
+    startupController.abort(reason);
+    if (startupComplete) {
+      void closeWithReason(reason).catch((err) => {
+        console.error("[scrcpy] cleanup failed:", err);
+      });
+    }
+  };
+
+  closeWithReason = (reason: Error): Promise<void> => {
+    if (closeTask) return closeTask;
+    opts.signal?.removeEventListener("abort", externalAbort);
+    startupController.abort(reason);
     try {
       videoSock?.destroy();
     } catch {}
@@ -350,70 +939,223 @@ export async function startScrcpy(opts: StartOpts): Promise<ScrcpySession> {
       controlSock?.destroy();
     } catch {}
     try {
-      proc?.kill("SIGKILL");
+      proc?.kill("SIGTERM");
     } catch {}
-    if (localPort !== null) {
-      try {
-        removeForward(serial, localPort);
-      } catch {}
-    }
+
+    const child = proc;
+    const paths = jarPaths;
+    closeTask = (async () => {
+      const cleanupErrors: unknown[] = [];
+      if (child && !childSettled) {
+        try {
+          await withDeadline(
+            runtime,
+            undefined,
+            timeouts.processExitMs,
+            "scrcpy process exit",
+            () => childDone,
+          );
+        } catch (termWaitError) {
+          let killError: unknown = null;
+          try {
+            child.kill("SIGKILL");
+          } catch (err) {
+            killError = err;
+          }
+          try {
+            await withDeadline(
+              runtime,
+              undefined,
+              timeouts.processExitMs,
+              "scrcpy process reap",
+              () => childDone,
+            );
+          } catch (reapError) {
+            cleanupErrors.push(
+              new AggregateError(
+                [termWaitError, ...(killError ? [killError] : []), reapError],
+                "scrcpy process did not exit during cleanup",
+              ),
+            );
+          }
+        }
+      }
+      const cleanupResults = await Promise.allSettled([
+        forwardAttempted
+          ? removeForwards(
+              runtime,
+              timeouts,
+              serial,
+              forwardTarget,
+              localPort,
+            )
+          : Promise.resolve(),
+        jarPreparationStarted && paths
+          ? removeWorkingJars(runtime, timeouts, serial, paths)
+          : Promise.resolve(),
+      ]);
+      cleanupErrors.push(
+        ...cleanupResults.flatMap((result) =>
+          result.status === "rejected" ? [result.reason] : [],
+        ),
+      );
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(cleanupErrors, "scrcpy cleanup failed");
+      }
+    })();
+    return closeTask;
   };
 
+  opts.signal?.addEventListener("abort", externalAbort, { once: true });
+  if (opts.signal?.aborted) externalAbort();
+
   try {
-    adb(serial, ["push", jar, DEVICE_JAR_PATH]);
-    localPort = forwardAbstractSocket(serial, scid);
-
-    proc = spawn(
-      "adb",
-      [
-        "-s",
-        serial,
-        "shell",
-        `CLASSPATH=${DEVICE_JAR_PATH}`,
-        "app_process",
-        "/",
-        "com.genymobile.scrcpy.Server",
-        SCRCPY_VERSION,
-        `scid=${scid}`,
-        "log_level=info",
-        "audio=false",
-        "tunnel_forward=true",
-        "control=true",
-        "send_dummy_byte=true",
-        "send_stream_meta=true",
-        "send_frame_meta=true",
-        "send_device_meta=true",
-        `max_size=${maxSize}`,
-        `video_bit_rate=${bitRate}`,
-        `max_fps=${maxFps}`,
-        ...(codecOptions.length > 0 ? [`video_codec_options=${codecOptions.join(",")}`] : []),
-        "cleanup=true",
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] },
+    throwIfAborted(startupController.signal, "scrcpy startup aborted");
+    const jar = await withDeadline(
+      runtime,
+      startupController.signal,
+      timeouts.pushMs,
+      "locating scrcpy server",
+      () => runtime.ensureServer(),
     );
-    proc.stdout?.on("data", (b: Buffer) => process.stdout.write(`[scrcpy] ${b}`));
-    proc.stderr?.on("data", (b: Buffer) => process.stderr.write(`[scrcpy] ${b}`));
+    const fingerprint = await withDeadline(
+      runtime,
+      startupController.signal,
+      timeouts.pushMs,
+      "hashing scrcpy server",
+      () => runtime.serverFingerprint(jar),
+    );
+    const cacheKey = fingerprint.slice(0, 24);
+    jarPaths = {
+      cache: `${DEVICE_JAR_CACHE_PATH}-${cacheKey}`,
+      temporary: `${DEVICE_JAR_CACHE_PATH}-${cacheKey}.${scid}.tmp`,
+      working: `/data/local/tmp/serve-emul-scrcpy-${scid}.jar`,
+    };
+    jarPreparationStarted = true;
+    await prepareDeviceServerJar(
+      runtime,
+      timeouts,
+      serial,
+      jar,
+      jarPaths,
+      startupController.signal,
+    );
+    throwIfAborted(startupController.signal, "scrcpy startup aborted");
+    forwardAttempted = true;
+    localPort = await forwardAbstractSocket(
+      runtime,
+      timeouts,
+      serial,
+      forwardTarget,
+      startupController.signal,
+    );
+    throwIfAborted(startupController.signal, "scrcpy startup aborted");
 
-    // Wait for the device-side abstract socket to appear before the host dials in;
-    // otherwise adb accepts the local connection, then closes it the moment the
-    // device-side connect fails, and the client sees a phantom EOF.
-    await waitForAbstractSocket(serial, `scrcpy_${scid}`);
+    proc = runtime.spawnAdb(serial, [
+      "shell",
+      `CLASSPATH=${jarPaths.working}`,
+      "app_process",
+      "/",
+      "com.genymobile.scrcpy.Server",
+      SCRCPY_VERSION,
+      `scid=${scid}`,
+      "log_level=info",
+      "audio=false",
+      "tunnel_forward=true",
+      "control=true",
+      "send_dummy_byte=true",
+      "send_stream_meta=true",
+      "send_frame_meta=true",
+      "send_device_meta=true",
+      `max_size=${maxSize}`,
+      `video_bit_rate=${bitRate}`,
+      `max_fps=${maxFps}`,
+      ...(codecOptions.length > 0
+        ? [`video_codec_options=${codecOptions.join(",")}`]
+        : []),
+      "cleanup=true",
+    ]);
+    childSettled = false;
+    let stderrTail = "";
+    childDone = new Promise<void>((resolve) => {
+      const settle = (startupError: Error) => {
+        if (childSettled) return;
+        childSettled = true;
+        resolve();
+        if (!startupComplete) startupController.abort(startupError);
+      };
+      proc!.once("error", (err) =>
+        settle(new Error(`scrcpy process failed during startup: ${err.message}`)),
+      );
+      proc!.once("exit", (code, signal) => {
+        const suffix = stderrTail.trim() ? `: ${stderrTail.trim()}` : "";
+        settle(
+          new Error(
+            `scrcpy process exited during startup (code=${code ?? "null"}, signal=${signal ?? "none"})${suffix}`,
+          ),
+        );
+      });
+    });
+    proc.stdout?.on("data", (b: Buffer) =>
+      process.stdout.write(`[scrcpy] ${b}`),
+    );
+    proc.stderr?.on("data", (b: Buffer) => {
+      stderrTail = `${stderrTail}${b.toString("utf8")}`.slice(-8_192);
+      process.stderr.write(`[scrcpy] ${b}`);
+    });
 
-    // scrcpy in tunnel_forward mode waits for ALL configured sockets to be
-    // connected before it begins streaming. Open both, then read the video
-    // preamble.
-    videoSock = await connectOnce(localPort);
-    controlSock = await connectOnce(localPort);
+    await withDeadline(
+      runtime,
+      startupController.signal,
+      timeouts.socketReadyMs,
+      `waiting for scrcpy abstract socket @scrcpy_${scid}`,
+      (signal) =>
+        waitForAbstractSocketAsync(
+          runtime,
+          timeouts,
+          serial,
+          `scrcpy_${scid}`,
+          signal,
+        ),
+    );
 
-    // After dummy byte, scrcpy may push clipboard events on the control socket;
-    // drain them.
+    videoSock = await withDeadline(
+      runtime,
+      startupController.signal,
+      timeouts.connectMs,
+      "connecting scrcpy video socket",
+      (signal) => runtime.connect(localPort!, timeouts.connectMs, signal),
+    );
+    throwIfAborted(startupController.signal, "scrcpy startup aborted");
+    controlSock = await withDeadline(
+      runtime,
+      startupController.signal,
+      timeouts.connectMs,
+      "connecting scrcpy control socket",
+      (signal) => runtime.connect(localPort!, timeouts.connectMs, signal),
+    );
+    throwIfAborted(startupController.signal, "scrcpy startup aborted");
     controlSock.on("data", () => {});
 
     const reader = new FramedReader(videoSock);
-    // scrcpy variants disagree on whether the video socket includes the dummy
-    // byte, so detect the codec metadata alignment instead of blindly skipping.
-    const preamble = parseVideoPreamble(await reader.read(81));
+    const preambleBytes = await withDeadline(
+      runtime,
+      startupController.signal,
+      timeouts.preambleMs,
+      "reading scrcpy video preamble",
+      () => reader.read(81, "header"),
+    );
+    throwIfAborted(startupController.signal, "scrcpy startup aborted");
+    const preamble = parseVideoPreamble(preambleBytes);
+    if (preamble.codecName !== "h264") {
+      throw new ScrcpyStreamError(
+        "unsupported-codec",
+        `bundled UI decodes H.264 only; device negotiated ${preamble.codecName}`,
+        { codec: preamble.codecName },
+      );
+    }
     reader.prepend(preamble.extra);
+    startupComplete = true;
 
     return {
       transport: "scrcpy",
@@ -431,10 +1173,20 @@ export async function startScrcpy(opts: StartOpts): Promise<ScrcpySession> {
       localPort,
       serial,
       readFrame: () => readFrame(reader, preamble.protocol),
-      close,
+      close: () => closeWithReason(new Error("scrcpy session closed")),
     };
   } catch (err) {
-    close();
+    const error = err instanceof Error ? err : new Error(String(err));
+    startupController.abort(error);
+    try {
+      await closeWithReason(error);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        error.message,
+        { cause: error },
+      );
+    }
     throw err;
   }
 }
@@ -449,40 +1201,40 @@ const PACKET_V4_FLAG_SESSION = 1n << 63n;
 const PACKET_V4_FLAG_CONFIG = 1n << 62n;
 const PACKET_V4_FLAG_KEY_FRAME = 1n << 61n;
 const PACKET_V3_FLAGS = PACKET_FLAG_CONFIG | PACKET_FLAG_KEY_FRAME;
-const PACKET_V4_FLAGS = PACKET_V4_FLAG_SESSION | PACKET_V4_FLAG_CONFIG | PACKET_V4_FLAG_KEY_FRAME;
+const PACKET_V4_FLAGS =
+  PACKET_V4_FLAG_SESSION | PACKET_V4_FLAG_CONFIG | PACKET_V4_FLAG_KEY_FRAME;
 
 export async function readFrame(
   reader: FramedReader,
   protocol: ScrcpyProtocol,
 ): Promise<VideoPacket | null> {
+  let header: Buffer;
   try {
-    const header = await reader.read(12);
-    const ptsRaw = header.readBigUInt64BE(0);
-    if (protocol === 4 && (ptsRaw & PACKET_V4_FLAG_SESSION) !== 0n) {
-      return {
-        type: "session",
-        clientResized: (header.readUInt32BE(0) & 1) !== 0,
-        width: header.readUInt32BE(4),
-        height: header.readUInt32BE(8),
-      };
-    }
-
-    const size = header.readUInt32BE(8);
-    if (size === 0 || size > 16 * 1024 * 1024) {
-      throw new Error(`invalid scrcpy frame size: ${size}`);
-    }
-    const isConfig =
-      protocol === 4
-        ? (ptsRaw & PACKET_V4_FLAG_CONFIG) !== 0n
-        : (ptsRaw & PACKET_FLAG_CONFIG) !== 0n;
-    const isKey =
-      protocol === 4
-        ? (ptsRaw & PACKET_V4_FLAG_KEY_FRAME) !== 0n
-        : (ptsRaw & PACKET_FLAG_KEY_FRAME) !== 0n;
-    const pts = ptsRaw & ~(protocol === 4 ? PACKET_V4_FLAGS : PACKET_V3_FLAGS);
-    const data = await reader.read(size);
-    return { type: "frame", data, pts, isConfig, isKey };
-  } catch {
-    return null;
+    header = await reader.read(12, "header");
+  } catch (e) {
+    // A clean EOF at a frame boundary is the only non-error stream end; every
+    // other failure (truncation, overflow, socket error) propagates with its
+    // original cause so callers can classify it.
+    if (e instanceof ScrcpyStreamError && e.code === "clean-eof") return null;
+    throw e;
   }
+
+  const parsed = parseFrameHeader(header, protocol);
+  if (parsed.kind === "session") {
+    return {
+      type: "session",
+      clientResized: parsed.clientResized,
+      width: parsed.width,
+      height: parsed.height,
+    };
+  }
+
+  const data = await reader.read(parsed.size, "payload");
+  return {
+    type: "frame",
+    data,
+    pts: parsed.pts,
+    isConfig: parsed.isConfig,
+    isKey: parsed.isKey,
+  };
 }
