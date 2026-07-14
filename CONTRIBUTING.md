@@ -7,10 +7,13 @@ and include enough verification detail for reviewers to reproduce your results.
 
 ## Development Setup
 
-Requirements:
+Required for the device-free development and CI checks:
 
-- Bun 1.1+
+- Bun 1.3.13 (the version pinned by the repository)
 - Node.js 18+
+
+Optional prerequisites for manual runtime validation:
+
 - Android platform-tools with `adb` on `PATH`
 - A booted Android emulator or attached Android device
 - Chrome, Edge, or Safari 16.4+ for WebCodecs support
@@ -18,7 +21,7 @@ Requirements:
 Install dependencies:
 
 ```sh
-bun install
+bun install --frozen-lockfile
 ```
 
 Fetch the vendored scrcpy server and build the browser UI:
@@ -60,12 +63,28 @@ Prefer kebab-case for TypeScript and JavaScript filenames.
 Before opening a pull request, run the checks that match your change:
 
 ```sh
+bun run --filter serve-emul test
+bun run --filter serve-emul coverage
 bun run --filter serve-emul typecheck
 bun run --filter serve-emul typecheck:ui
+bun run --filter serve-emul typecheck:tests
 bun run --filter serve-emul build
 ```
 
-For runtime changes, also test against a real device or emulator:
+Run the same aggregate check used by CI before requesting review:
+
+```sh
+bun run check
+```
+
+The aggregate check verifies generated documentation, runs package coverage,
+checks the server, browser, and test TypeScript projects, builds the production
+UI, and exercises the packed package. The default CI suite is entirely
+device-free: fake clocks, timers, sockets, processes, and sessions exercise
+lifecycle and protocol behavior without an Android SDK, ADB, an emulator, or a
+connected device.
+
+For runtime changes, optionally supplement CI with a real device or emulator:
 
 ```sh
 adb devices
@@ -85,21 +104,17 @@ you performed in the pull request.
 
 ## scrcpy and ADB Notes
 
-Streaming uses the vendored scrcpy server at `vendor/scrcpy-server-v<VERSION>`.
+Streaming uses the vendored scrcpy server at
+`packages/serve-emul/vendor/scrcpy-server-v<VERSION>`.
 The pinned version is controlled by `packages/serve-emul/scripts/fetch-scrcpy.ts`.
 
 The scrcpy wire protocol can drift between major versions. If you bump the
-scrcpy server version, re-validate `packages/serve-emul/src/scrcpy.ts` against the
-new server and document what changed.
-
-Current protocol shape:
-
-- open two sockets through `adb forward tcp:<port> localabstract:scrcpy_<scid>`
-- both sockets start with a 1-byte dummy prefix
-- the video socket sends a 64-byte device name and 12-byte codec metadata
-- each frame is `[8-byte PTS big-endian, 4-byte size big-endian, Annex-B NALUs]`
-- the high bit of PTS marks codec configuration frames
-- the control socket consumes binary messages encoded in `src/input.ts`
+scrcpy server version, follow the complete
+[scrcpy upgrade checklist](packages/serve-emul/docs/protocol.md#scrcpy-upgrade-checklist).
+The canonical protocol reference documents the current v3/v4 video framing,
+control messages, `SEMU` WebSocket metadata, and byte-level golden examples. Do
+not duplicate those layouts in another document; update the reference and its
+parser fixtures together.
 
 Do not shell out to `adb shell input` for device interaction. Write to scrcpy's
 control socket instead; the latency difference is large enough to affect agent
@@ -147,6 +162,12 @@ git commit -m "<scoped message>" -- path/to/file1 path/to/file2
 source of truth. Release tags should be named `v<version>`, for example
 `v0.1.0`.
 
+The npm package is CLI-only and intentionally has no supported JavaScript or
+TypeScript imports. Any future programmatic entry point must be added explicitly
+to `exports`, documented as a supported API, exercised from the packed tarball
+in a temporary consumer, and reviewed for its semver impact. Publishing source
+files does not make their deep-import paths public APIs.
+
 Choose the version bump with semver:
 
 - `patch` for fixes and small internal improvements
@@ -167,8 +188,9 @@ Before publishing, review `packages/serve-emul/CHANGELOG.md`, then run:
 bun run check
 ```
 
-That runs the package tests, server typecheck, UI typecheck, and production UI
-build.
+That verifies generated documentation, runs package coverage, checks the server,
+UI, and test TypeScript projects, builds the production UI, and runs the
+packed-tarball consumer smoke test.
 
 Commit only the version and changelog files, then tag and publish:
 
