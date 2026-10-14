@@ -1,3 +1,5 @@
+import type { AvdCatalog, AvdProfile, AvdSystemImage } from "./avd-contracts";
+import { FOLD_POSTURES, type FoldPosture, type FoldableState } from "./foldable-contracts";
 import { parseGesture, type Gesture } from "./control-contracts";
 
 /** Stable error codes sent by every JSON API failure. */
@@ -91,6 +93,10 @@ export type OrientationResponse = ApiSuccess<{ orientation: OrientationStatus }>
 export type NightMode = "auto" | "dark" | "light";
 export type NightModeStatus = { mode: NightMode | "unknown"; raw: string };
 export type NightModeResponse = ApiSuccess<{ nightMode: NightModeStatus }>;
+
+export type FoldableResponse = ApiSuccess<{ foldable: FoldableState }>;
+export type AvdCatalogResponse = ApiSuccess<AvdCatalog>;
+export type AvdCreateResponse = ApiSuccess<{ avd: string }>;
 
 export type FontScaleStatus = { scale: number; raw: string };
 export type FontScaleResponse = ApiSuccess<{ fontScale: FontScaleStatus }>;
@@ -214,7 +220,18 @@ export type LocationSessionEvent = {
   kind: "location";
   location: GeoFix;
 };
-export type SessionEvent = GestureSessionEvent | LocationSessionEvent;
+export type PostureSessionEvent = {
+  id: number;
+  at: string;
+  delayMs: number;
+  source: string;
+  kind: "posture";
+  posture: FoldPosture;
+};
+export type SessionEvent =
+  | GestureSessionEvent
+  | LocationSessionEvent
+  | PostureSessionEvent;
 export type SessionReplayStatus =
   | "idle"
   | "running"
@@ -401,6 +418,17 @@ export type ApiContractMap = {
   };
   "/api/avds/stop": {
     POST: EndpointContract<{ serial?: string; avd?: string }, AvdStopResponse>;
+  };
+  "/api/avds/catalog": { GET: EndpointContract<undefined, AvdCatalogResponse> };
+  "/api/avds/create": {
+    POST: EndpointContract<
+      { name: string; profile: string; image: string },
+      AvdCreateResponse
+    >;
+  };
+  "/api/foldable": {
+    GET: EndpointContract<undefined, FoldableResponse>;
+    POST: EndpointContract<{ posture: FoldPosture; record?: boolean }, FoldableResponse>;
   };
   "/api/orientation": {
     GET: EndpointContract<undefined, OrientationResponse>;
@@ -727,6 +755,57 @@ export function parseNightModeResponse(value: unknown): NightModeResponse {
   };
 }
 
+function parseFoldableResponse(value: unknown): FoldableResponse {
+  const root = record(value, "foldable response");
+  if (root.ok !== true) fail("foldable response.ok must be true");
+  const item = record(root.foldable, "foldable");
+  return {
+    ok: true,
+    foldable: {
+      supported: boolean(item.supported, "foldable.supported"),
+      posture: oneOf(item.posture, [...FOLD_POSTURES, "unknown"] as const, "foldable.posture"),
+      ...(item.reason === undefined ? {} : { reason: string(item.reason, "foldable.reason") }),
+    },
+  };
+}
+
+function parseAvdProfile(value: unknown, index: number): AvdProfile {
+  const item = record(value, `profiles[${index}]`);
+  return {
+    id: string(item.id, `profiles[${index}].id`),
+    name: string(item.name, `profiles[${index}].name`),
+    manufacturer: string(item.manufacturer, `profiles[${index}].manufacturer`),
+    foldable: boolean(item.foldable, `profiles[${index}].foldable`),
+  };
+}
+
+function parseAvdSystemImage(value: unknown, index: number): AvdSystemImage {
+  const item = record(value, `images[${index}]`);
+  return {
+    id: string(item.id, `images[${index}].id`),
+    name: string(item.name, `images[${index}].name`),
+    abi: string(item.abi, `images[${index}].abi`),
+  };
+}
+
+function parseAvdCatalogResponse(value: unknown): AvdCatalogResponse {
+  const root = record(value, "avd catalog response");
+  if (root.ok !== true) fail("avd catalog response.ok must be true");
+  if (!Array.isArray(root.profiles)) fail("profiles must be an array");
+  if (!Array.isArray(root.images)) fail("images must be an array");
+  return {
+    ok: true,
+    profiles: root.profiles.map(parseAvdProfile),
+    images: root.images.map(parseAvdSystemImage),
+  };
+}
+
+function parseAvdCreateResponse(value: unknown): AvdCreateResponse {
+  const root = record(value, "avd create response");
+  if (root.ok !== true) fail("avd create response.ok must be true");
+  return { ok: true, avd: string(root.avd, "avd") };
+}
+
 export function parseFontScaleResponse(value: unknown): FontScaleResponse {
   const root = record(value, "font scale response");
   if (root.ok !== true) fail("font scale response.ok must be true");
@@ -906,6 +985,13 @@ function parseSessionEvent(value: unknown, index: number): SessionEvent {
       ...base,
       kind: "location",
       location: parseGeoFix(item.location, `session.events[${index}].location`),
+    };
+  }
+  if (item.kind === "posture") {
+    return {
+      ...base,
+      kind: "posture",
+      posture: oneOf(item.posture, FOLD_POSTURES, `session.events[${index}].posture`),
     };
   }
   return fail(`session.events[${index}].kind is invalid`);
@@ -1236,6 +1322,9 @@ export const API_SUCCESS_PARSERS = {
   "/api/devices/select": { POST: parseDeviceSelectionResponse },
   "/api/avds/start": { POST: parseAvdStartResponse },
   "/api/avds/stop": { POST: parseAvdStopResponse },
+  "/api/avds/catalog": { GET: parseAvdCatalogResponse },
+  "/api/avds/create": { POST: parseAvdCreateResponse },
+  "/api/foldable": { GET: parseFoldableResponse, POST: parseFoldableResponse },
   "/api/orientation": { GET: parseOrientationResponse, POST: parseOrientationResponse },
   "/api/night-mode": { GET: parseNightModeResponse, POST: parseNightModeResponse },
   "/api/font-scale": { GET: parseFontScaleResponse, POST: parseFontScaleResponse },

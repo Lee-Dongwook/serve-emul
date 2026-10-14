@@ -94,6 +94,13 @@ export function sessionRoutes(): ApiRoute<ApiDependencies>[] {
         const handlers = createSessionReplayHandlers({
           generation: requestContext.generation,
           getGeneration: () => sessions.current.generation,
+          setPosture: async (posture, signal) => {
+            await deps.device.setFoldPosture(
+              requestContext.serial,
+              posture,
+              AbortSignal.any([signal, requestContext.signal]),
+            );
+          },
           dispatchGesture: (gesture) =>
             enqueueGesture(
               requestContext,

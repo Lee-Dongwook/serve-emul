@@ -1,3 +1,4 @@
+import type { AvdManager } from "../avd-manager.ts";
 import type { DeviceService } from "../device-service.ts";
 import type { ApiErrorFallback } from "./error-mapping.ts";
 import type { AccessibilitySnapshot } from "../accessibility.ts";
@@ -46,6 +47,8 @@ export type ApiDependencies = {
   /** Device commands; pass the signal runForContext provides. */
   device: DeviceService;
   listDevices: () => Promise<Device[]>;
+  /** Host AVD catalog and creation, independent of the device session. */
+  avds: AvdManager;
   deviceGrid: (context: DeviceContext) => Promise<DeviceGridResponse>;
   switchSession: (serial: string) => Promise<DeviceSelectionResponse>;
   launchEmulator: (opts: StartEmulatorOpts) => Promise<EmulatorLaunch>;

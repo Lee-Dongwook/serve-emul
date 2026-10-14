@@ -8,6 +8,7 @@ import { apiErrorMessage, apiRequest } from "../lib/api-client";
 import { DEVICE_SETTINGS, useDeviceSetting } from "../lib/device-setting";
 import { deviceSessionStore, useDeviceSessionSnapshot } from "../lib/device-session-store";
 import { usePoll } from "../lib/use-poll";
+import { AddEmulator } from "./add-emulator";
 
 type BusyAction = "select" | "start" | "stop";
 const FONT_SCALE_PRESETS = [0.85, 1, 1.15, 1.3, 1.5] as const;
@@ -136,6 +137,7 @@ export function DevicePanel() {
         )}
       </div>
 
+      <AddEmulator onCreated={() => { setQuery(""); refreshDevices(); }} />
       <button onClick={refreshDevices}>Refresh Devices</button>
     </section>
   );

@@ -1,6 +1,8 @@
+import { AvdManagerError } from "../avd-manager.ts";
 import { commandFailureOf } from "../command-failure.ts";
 import { ControlInputError } from "../control-input-queue.ts";
 import { SessionChangedError } from "../device-session-context.ts";
+import { FoldableError } from "../foldable.ts";
 import { MultipartUploadError } from "../multipart-upload.ts";
 import { HttpBodyError } from "../request-body.ts";
 import {
@@ -36,6 +38,20 @@ const UPLOAD_MANAGER_ERRORS: Record<
   closed: ["service_unavailable", "upload-service-closed"],
   "device-session-changed": ["conflict", "device-session-changed"],
   "upload-cancelled": ["invalid_request", "upload-cancelled"],
+};
+
+const AVD_MANAGER_ERRORS: Record<AvdManagerError["code"], ApiErrorCode> = {
+  invalid: "invalid_request",
+  busy: "conflict",
+  exists: "conflict",
+  "tools-unavailable": "service_unavailable",
+  "command-failed": "downstream_failure",
+};
+
+const FOLDABLE_ERRORS: Record<FoldableError["code"], ApiErrorCode> = {
+  busy: "conflict",
+  unsupported: "invalid_request",
+  unconfirmed: "downstream_failure",
 };
 
 const message = (err: unknown) =>
@@ -96,6 +112,12 @@ export function toApiError(
       err,
       err.code,
     );
+  }
+  if (err instanceof AvdManagerError) {
+    return api(AVD_MANAGER_ERRORS[err.code], err.publicMessage, err, `avd-${err.code}`);
+  }
+  if (err instanceof FoldableError) {
+    return api(FOLDABLE_ERRORS[err.code], message(err), err, `foldable-${err.code}`);
   }
   if (err instanceof RoutePlaybackConflictError) {
     return api("conflict", message(err), err);

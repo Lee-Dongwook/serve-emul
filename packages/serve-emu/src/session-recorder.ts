@@ -1,6 +1,7 @@
 import { publicErrorMessage } from "./command-failure.ts";
 import { normalizeTextForControl, type Gesture } from "./input.ts";
 import type { GeoFix } from "./location.ts";
+import type { FoldPosture } from "./shared/foldable-contracts.ts";
 
 // Wire shapes live in the shared contract so the UI parser and the server
 // cannot drift apart.
@@ -37,6 +38,7 @@ export type ReplayHandlers = {
     signal: AbortSignal,
   ) => Promise<void> | void;
   setLocation: (fix: GeoFix, signal: AbortSignal) => Promise<void> | void;
+  setPosture?: (posture: FoldPosture, signal: AbortSignal) => Promise<void> | void;
 };
 
 export type SessionReplayClock = {
@@ -93,9 +95,13 @@ function cloneGesture(gesture: Gesture): Gesture {
 }
 
 function cloneEvent(event: RecordedEvent): RecordedEvent {
-  return event.kind === "gesture"
-    ? { ...event, gesture: cloneGesture(event.gesture) }
-    : { ...event, location: { ...event.location } };
+  if (event.kind === "gesture") {
+    return { ...event, gesture: cloneGesture(event.gesture) };
+  }
+  if (event.kind === "location") {
+    return { ...event, location: { ...event.location } };
+  }
+  return { ...event };
 }
 
 function abortReason(signal: AbortSignal): Error {
@@ -199,6 +205,10 @@ export class SessionRecorder {
 
   recordLocation(location: GeoFix, source: string): void {
     this.#record({ kind: "location", location, source });
+  }
+
+  recordPosture(posture: FoldPosture, source: string): void {
+    this.#record({ kind: "posture", posture, source });
   }
 
   clear(): SessionSummary {
@@ -318,6 +328,14 @@ export class SessionRecorder {
       );
     }
     validateMultiplier(multiplier);
+    if (
+      !handlers.setPosture &&
+      this.#events.some((event) => event.kind === "posture")
+    ) {
+      throw new SessionReplayValidationError(
+        "posture replay is not supported for this device",
+      );
+    }
 
     const events = this.#events.map(cloneEvent);
     const replay: ActiveReplay = {
@@ -372,11 +390,13 @@ export class SessionRecorder {
           } else {
             await handlers.dispatchGesture(gesture, replay.controller.signal);
           }
-        } else {
+        } else if (event.kind === "location") {
           await handlers.setLocation(
             event.location,
             replay.controller.signal,
           );
+        } else {
+          await handlers.setPosture!(event.posture, replay.controller.signal);
         }
         this.#assertReplayActive(replay);
       }
@@ -438,7 +458,8 @@ export class SessionRecorder {
   #record(
     event:
       | { kind: "gesture"; gesture: Gesture; source: string }
-      | { kind: "location"; location: GeoFix; source: string },
+      | { kind: "location"; location: GeoFix; source: string }
+      | { kind: "posture"; posture: FoldPosture; source: string },
   ): void {
     if (this.#closed || !this.#recording || this.#replaying) return;
     const now = this.#clock.now();
@@ -456,7 +477,9 @@ export class SessionRecorder {
     const recorded: RecordedEvent =
       event.kind === "gesture"
         ? { ...base, kind: "gesture", gesture: cloneGesture(event.gesture) }
-        : { ...base, kind: "location", location: { ...event.location } };
+        : event.kind === "location"
+          ? { ...base, kind: "location", location: { ...event.location } }
+          : { ...base, kind: "posture", posture: event.posture };
     const bytes = Buffer.byteLength(JSON.stringify(recorded), "utf8");
     if (EMPTY_ARRAY_BYTES + bytes > this.#maxBytes) {
       this.#droppedEvents++;

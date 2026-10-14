@@ -18,6 +18,8 @@ import {
   launchApp,
 } from "./app-management.ts";
 import type { AdbDeps } from "./adb-command.ts";
+import { getFoldableState, setFoldPosture } from "./foldable.ts";
+import type { FoldPosture, FoldableState } from "./shared/foldable-contracts.ts";
 import type {
   AppActionResponse,
   FontScaleStatus,
@@ -49,6 +51,8 @@ export type DeviceService = {
   clearAppData(serial: string, packageName: string, signal: AbortSignal): Promise<AppActionResponse>;
   forceStopApp(serial: string, packageName: string, signal: AbortSignal): Promise<AppActionResponse>;
   grantPermission(serial: string, packageName: string, permission: string, signal: AbortSignal): Promise<AppActionResponse>;
+  foldable(serial: string, signal: AbortSignal): Promise<FoldableState>;
+  setFoldPosture(serial: string, posture: FoldPosture, signal: AbortSignal): Promise<FoldableState>;
   /** Abstract socket names of the scrcpy sessions on the device, this server's included. */
   scrcpySockets(serial: string, signal: AbortSignal): Promise<string[]>;
 };
@@ -77,6 +81,9 @@ export function createDeviceService(runners: DeviceServiceRunners = {}): DeviceS
       forceStopApp(serial, packageName, deps(signal)),
     grantPermission: (serial, packageName, permission, signal) =>
       grantPermission(serial, packageName, permission, deps(signal)),
+    foldable: (serial, signal) => getFoldableState(serial, deps(signal)),
+    setFoldPosture: (serial, posture, signal) =>
+      setFoldPosture(serial, posture, deps(signal)),
     scrcpySockets: (serial, signal) => listScrcpySockets(serial, deps(signal)),
   };
 }

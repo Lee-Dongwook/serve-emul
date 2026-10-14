@@ -15,6 +15,7 @@ function labelForEvent(event: SessionEvent): string {
   if (event.kind === "gesture") {
     return `${event.gesture.type} • ${event.source}`;
   }
+  if (event.kind === "posture") return `posture ${event.posture} • ${event.source}`;
   const lat = event.location.latitude.toFixed(5);
   const lng = event.location.longitude.toFixed(5);
   return `location ${lat}, ${lng}`;

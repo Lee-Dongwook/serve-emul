@@ -8,6 +8,7 @@ import {
 import { listAllDevices } from "./adb.ts";
 import { createApiRouter } from "./api/router.ts";
 import type { ApiDependencies } from "./api/dependencies.ts";
+import { avdManager, type AvdManager } from "./avd-manager.ts";
 import { createDeviceService, type DeviceService } from "./device-service.ts";
 import { apiErrorResponse } from "./api/api-error.ts";
 import { toApiError, type ApiErrorFallback } from "./api/error-mapping.ts";
@@ -127,6 +128,8 @@ export type ServerDependencies = {
   listAvds?: typeof listAvds;
   /** Device commands used by the API routes (screenshot, settings, apps). */
   deviceService?: DeviceService;
+  /** Host AVD catalog and creation used by the Add emulator dialog. */
+  avds?: AvdManager;
   /** Startup and session lines ("scrcpy ready: …"); console.log by default. */
   log?: (line: string) => void;
   loadAccessibility?: (
@@ -384,6 +387,7 @@ export async function startServer(
     MAX_ROUTE_BODY_BYTES,
     device,
     listDevices,
+    avds: dependencies.avds ?? avdManager,
     switchSession,
     launchEmulator: emulators.launchEmulator,
     listActiveAvds,

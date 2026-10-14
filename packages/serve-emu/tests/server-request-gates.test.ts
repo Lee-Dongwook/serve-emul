@@ -457,6 +457,8 @@ describe("server HTTP and WebSocket boundaries", () => {
       ["/api/devices/select", {}],
       ["/api/avds/start", {}],
       ["/api/avds/stop", {}],
+      ["/api/avds/create", { name: "../escape", profile: "pixel_fold", image: "x" }],
+      ["/api/foldable", { posture: "tent" }],
       ["/api/orientation", { orientation: "upside-down" }],
       ["/api/night-mode", { mode: "midnight" }],
       ["/api/font-scale", { scale: 3 }],

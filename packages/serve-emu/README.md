@@ -358,7 +358,37 @@ one bounded `adb shell` call. `/health` reports the last answer and never
 waits for a probe. `contention` is `null` until the first probe answers. The
 UI shows a warning in the status bar while the count is above zero.
 
+Create an emulator from **Add emulator** in the Devices panel. Choose a name,
+SDK hardware profile (including Fold-in, Flip-style and
+Pixel Fold profiles when installed), and a system image compatible with the
+host CPU. Creation does not start the device or change the active session;
+use **Start** in the Devices panel afterward. Foldable profiles run stock
+Android, not Samsung One UI.
+
+Creation requires Android SDK Command-line Tools and Java 17 or newer. Install
+the tools through Android Studio → SDK Manager → SDK Tools, and set
+`ANDROID_HOME` to the SDK directory. Set `JAVA_HOME` if Java is not on PATH;
+Android Studio's bundled JBR can be used. System images must already be installed
+through SDK Manager → SDK Platforms (Show Package Details). The dialog includes
+setup guidance and a reload action. Existing AVDs are never overwritten.
+
 AVD lifecycle helpers:
+
+```sh
+# Discover hardware profile IDs and installed, host-compatible image IDs.
+curl "$BASE/api/avds/catalog"
+
+# Use profile/image IDs returned by the catalog.
+curl -X POST "$BASE/api/avds/create" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"My_Fold","profile":"pixel_fold","image":"system-images;android-34;google_apis_playstore;arm64-v8a"}'
+```
+
+Creation returns HTTP 201 with `{ "ok": true, "avd": "My_Fold" }`.
+Names use 1–80 letters, numbers, underscores or hyphens and begin with a letter
+or number. Duplicate names and concurrent creation requests return HTTP 409;
+missing SDK tools return HTTP 503 and a failing SDK command returns HTTP 502,
+both with setup guidance.
 
 ```sh
 curl -X POST "$BASE/api/avds/start" \
@@ -387,6 +417,35 @@ first, or stopped that emulator through `/api/avds/stop`. An `--avd` that
 was already running is only attached to, so its exit does not stop
 `serve-emu`. When the port is already
 taken by another `serve-emu`, startup names that server's device and status.
+
+### Foldable Testing
+
+Select a running Pixel Fold or Fold-in AVD, then open **Foldable** in the tools
+sidebar. **Fold**, **Half-open**, and **Unfold** use the emulator’s native
+hinge/posture controls, so Android receives actual device-state changes. The
+panel reads Android’s committed posture; non-foldable and physical devices show
+setup guidance. Video and touch coordinates follow the active display size.
+Half-open selects a hinge posture; the app decides whether to show a tabletop
+or two-pane layout.
+
+The browser mirrors a flat image of the active display, not a 3D bent device.
+Half-open keeps the entire inner screen active and may look unchanged on an
+app's home screen. For tabletop testing, use **Orientation** to turn the hinge
+horizontally and open an app screen that responds to that posture.
+
+```sh
+curl "$BASE/api/foldable"
+curl -X POST "$BASE/api/foldable" \
+  -H 'Content-Type: application/json' \
+  -d '{"posture":"folded"}'
+# Other postures: "half-open", "unfolded".
+```
+
+Posture actions are recorded by default and replay alongside gestures and
+location changes. Pass `"record": false` to omit an action. Use the **Session**
+tool to replay a fold/unfold sequence while checking app state preservation.
+These controls require an Android emulator with a hinge sensor; Samsung One UI
+is not emulated. See [Android’s native posture commands](https://developer.android.com/blog/posts/emulator-control-for-adaptive-app-development).
 
 ### Input
 
