@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { settledSessionKey, useDeviceSessionSnapshot } from "../lib/device-session-store";
 import {
   LogcatBatchPublisher,
   LogcatRingBuffer,
@@ -140,6 +141,23 @@ export function LogcatPanel() {
       publisherRef.current?.dispose();
     };
   }, []);
+
+  // The panel stays mounted across device switches, so drop the previous
+  // device's lines and resubscribe once a different session is settled.
+  // Transitional snapshots (no generation yet) are ignored.
+  const deviceSession = useDeviceSessionSnapshot();
+  const settledSession = settledSessionKey(deviceSession);
+  const lastSessionRef = useRef<string | null>(null);
+  const connectRef = useRef(connect);
+  connectRef.current = connect;
+  useEffect(() => {
+    if (settledSession === null) return;
+    const previous = lastSessionRef.current;
+    lastSessionRef.current = settledSession;
+    if (previous === null || previous === settledSession) return;
+    publisherRef.current?.clear();
+    if (eventSourceRef.current) connectRef.current();
+  }, [settledSession]);
 
   const copyLogs = async () => {
     try {

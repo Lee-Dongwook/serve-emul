@@ -28,6 +28,10 @@ header h1 {
   margin: 0;
   letter-spacing: 0.02em;
 }
+header .contention {
+  font-size: 12px;
+  color: #ffcc66;
+}
 header .meta {
   font-size: 12px;
   color: #8a8a93;
@@ -437,6 +441,11 @@ input[type="checkbox"] {
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
+.route-error {
+  color: #ff4d5e;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
 .toggle-row {
   display: flex;
   align-items: center;
@@ -622,6 +631,22 @@ input[type="checkbox"] {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 10px;
 }
+.panel-error {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #5a2a2a;
+  border-radius: 8px;
+  color: #f2b8b8;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.panel-error p {
+  margin: 0;
+}
+
 .device-empty {
   padding: 12px;
   border: 1px dashed #2a2a32;

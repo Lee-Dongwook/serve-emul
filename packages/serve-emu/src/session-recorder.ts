@@ -1,59 +1,23 @@
-import type { FoldPosture } from "./shared/foldable-contracts.ts";
+import { publicErrorMessage } from "./command-failure.ts";
 import { normalizeTextForControl, type Gesture } from "./input.ts";
 import type { GeoFix } from "./location.ts";
+import type { FoldPosture } from "./shared/foldable-contracts.ts";
 
-export type RecordedEvent =
-  | { id: number; at: string; delayMs: number; source: string; kind: "posture"; posture: FoldPosture }
-  | {
-      id: number;
-      at: string;
-      delayMs: number;
-      source: string;
-      kind: "gesture";
-      gesture: Gesture;
-    }
-  | {
-      id: number;
-      at: string;
-      delayMs: number;
-      source: string;
-      kind: "location";
-      location: GeoFix;
-    };
-
-export type SessionSnapshot = {
-  events: RecordedEvent[];
-  recording: boolean;
-  replaying: boolean;
-  replayStatus: "idle" | "running" | "completed" | "cancelled" | "error";
-  replayStartedAt: string | null;
-  replayCompletedAt: string | null;
-  replayCancelledAt: string | null;
-  lastError: string | null;
-};
-
-export type SessionSummary = {
-  eventCount: number;
-  retainedBytes: number;
-  limits: { maxEvents: number; maxBytes: number };
-  droppedEvents: number;
-  oldestEventId: number | null;
-  newestEventId: number | null;
-  oldestEventAt: string | null;
-  newestEventAt: string | null;
-  recording: boolean;
-  replaying: boolean;
-  replayStartedAt: string | null;
-  replayCompletedAt: string | null;
-  lastError: string | null;
-};
-
-export type SessionPage = {
-  session: SessionSummary;
-  events: RecordedEvent[];
-  nextBefore: number | null;
-  hasMore: boolean;
-};
+// Wire shapes live in the shared contract so the UI parser and the server
+// cannot drift apart.
+export type {
+  SessionEvent as RecordedEvent,
+  SessionPage,
+  SessionSnapshot,
+  SessionSummary,
+} from "./shared/api-contracts.ts";
+import type {
+  SessionEvent as RecordedEvent,
+  SessionExport,
+  SessionPage,
+  SessionSnapshot,
+  SessionSummary,
+} from "./shared/api-contracts.ts";
 
 export type SessionRecorderOptions = {
   maxEvents?: number;
@@ -63,16 +27,18 @@ export type SessionRecorderOptions = {
   sleep?: (ms: number) => Promise<void>;
 };
 
+type TouchGesture = Extract<Gesture, { type: "touch" }>;
+
 export const DEFAULT_MAX_SESSION_EVENTS = 2_000;
 export const DEFAULT_MAX_SESSION_BYTES = 1024 * 1024;
 
 export type ReplayHandlers = {
-  setPosture?: (posture: FoldPosture, signal: AbortSignal) => Promise<void> | void;
   dispatchGesture: (
     gesture: Gesture,
     signal: AbortSignal,
   ) => Promise<void> | void;
   setLocation: (fix: GeoFix, signal: AbortSignal) => Promise<void> | void;
+  setPosture?: (posture: FoldPosture, signal: AbortSignal) => Promise<void> | void;
 };
 
 export type SessionReplayClock = {
@@ -97,12 +63,6 @@ export class SessionReplayConflictError extends Error {
     super(message);
     this.name = "SessionReplayConflictError";
   }
-}
-
-export function sessionReplayErrorStatus(error: unknown): number {
-  if (error instanceof SessionReplayValidationError) return 400;
-  if (error instanceof SessionReplayConflictError) return 409;
-  return 500;
 }
 
 export function parseSessionReplayMultiplier(value: unknown): number {
@@ -135,10 +95,13 @@ function cloneGesture(gesture: Gesture): Gesture {
 }
 
 function cloneEvent(event: RecordedEvent): RecordedEvent {
-  if (event.kind === "posture") return { ...event };
-  return event.kind === "gesture"
-    ? { ...event, gesture: cloneGesture(event.gesture) }
-    : { ...event, location: { ...event.location } };
+  if (event.kind === "gesture") {
+    return { ...event, gesture: cloneGesture(event.gesture) };
+  }
+  if (event.kind === "location") {
+    return { ...event, location: { ...event.location } };
+  }
+  return { ...event };
 }
 
 function abortReason(signal: AbortSignal): Error {
@@ -197,8 +160,6 @@ export class SessionRecorder {
   #closed = false;
   #admissionEpoch = 0;
   #clock: SessionReplayClock;
-  #legacySleep: (ms: number) => Promise<void>;
-  #legacyStopReplay = false;
 
   constructor(
     clockOrOptions: SessionReplayClock | SessionRecorderOptions =
@@ -220,9 +181,6 @@ export class SessionRecorder {
             },
           }
         : SYSTEM_REPLAY_CLOCK);
-    this.#legacySleep =
-      options.sleep ??
-      ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.#maxEvents = options.maxEvents ?? DEFAULT_MAX_SESSION_EVENTS;
     this.#maxBytes = options.maxBytes ?? DEFAULT_MAX_SESSION_BYTES;
     if (!Number.isSafeInteger(this.#maxEvents) || this.#maxEvents <= 0) {
@@ -245,12 +203,12 @@ export class SessionRecorder {
     this.#record({ kind: "gesture", gesture, source });
   }
 
-  recordPosture(posture: FoldPosture, source: string): void {
-    this.#record({ kind: "posture", posture, source });
-  }
-
   recordLocation(location: GeoFix, source: string): void {
     this.#record({ kind: "location", location, source });
+  }
+
+  recordPosture(posture: FoldPosture, source: string): void {
+    this.#record({ kind: "posture", posture, source });
   }
 
   clear(): SessionSummary {
@@ -351,67 +309,8 @@ export class SessionRecorder {
     };
   }
 
-  export(): { session: SessionSummary; events: RecordedEvent[] } {
+  export(): SessionExport {
     return { session: this.summary(), events: this.#events.map(cloneEvent) };
-  }
-
-  async replay(
-    handlers: {
-      setPosture?: (posture: FoldPosture) => Promise<void> | void;
-      dispatchGesture: (gesture: Gesture) => Promise<void> | void;
-      setLocation: (fix: GeoFix) => Promise<void> | void;
-    },
-    multiplier = 1,
-  ): Promise<SessionSummary> {
-    if (this.#closed) {
-      throw new SessionReplayConflictError("session recorder is closed");
-    }
-    if (this.#replaying) {
-      throw new SessionReplayConflictError("session replay is already running");
-    }
-    if (this.#events.length === 0) {
-      throw new SessionReplayValidationError("session has no recorded events");
-    }
-    validateMultiplier(multiplier);
-    const events = this.#events.map(cloneEvent);
-    if (events.some((event) => event.kind === "posture") && !handlers.setPosture) {
-      throw new SessionReplayValidationError("posture replay is not supported by this handler");
-    }
-    this.#replaying = true;
-    this.#legacyStopReplay = false;
-    this.#replayStartedAt = new Date(this.#clock.now()).toISOString();
-    this.#replayCompletedAt = null;
-    this.#lastError = null;
-    let targetMs = this.#clock.now();
-    try {
-      for (const event of events) {
-        targetMs += event.delayMs / multiplier;
-        await this.#legacySleep(Math.max(0, targetMs - this.#clock.now()));
-        if (this.#legacyStopReplay) break;
-        if (event.kind === "posture") {
-          await handlers.setPosture!(event.posture);
-        } else if (event.kind === "gesture") {
-          await handlers.dispatchGesture(cloneGesture(event.gesture));
-        } else {
-          await handlers.setLocation({ ...event.location });
-        }
-      }
-      this.#replayCompletedAt = new Date(this.#clock.now()).toISOString();
-      this.#replaying = false;
-      return this.summary();
-    } catch (err) {
-      this.#lastError = err instanceof Error ? err.message : String(err);
-      throw err;
-    } finally {
-      this.#replaying = false;
-      this.#legacyStopReplay = false;
-    }
-  }
-
-  stopReplay(): SessionSummary {
-    this.#legacyStopReplay = true;
-    this.#activeReplay?.controller.abort();
-    return this.summary();
   }
 
   startReplay(handlers: ReplayHandlers, multiplier = 1): SessionReplayRun {
@@ -429,11 +328,16 @@ export class SessionRecorder {
       );
     }
     validateMultiplier(multiplier);
+    if (
+      !handlers.setPosture &&
+      this.#events.some((event) => event.kind === "posture")
+    ) {
+      throw new SessionReplayValidationError(
+        "posture replay is not supported for this device",
+      );
+    }
 
     const events = this.#events.map(cloneEvent);
-    if (events.some((event) => event.kind === "posture") && !handlers.setPosture) {
-      throw new SessionReplayValidationError("posture replay is not supported by this handler");
-    }
     const replay: ActiveReplay = {
       id: this.#nextReplayId++,
       controller: new AbortController(),
@@ -460,6 +364,10 @@ export class SessionRecorder {
   ): Promise<SessionSnapshot> {
     let outcome: "completed" | "cancelled" | "error" = "completed";
     let targetMs = this.#clock.now();
+    // Touch pointers this replay has pressed, with their last gesture. A move
+    // or up whose down was not replayed (evicted, or recorded unpaired) is
+    // skipped, and anything still pressed is released when replay ends.
+    const pressed = new Map<number, TouchGesture>();
     try {
       for (const event of events) {
         this.#assertReplayActive(replay);
@@ -469,18 +377,26 @@ export class SessionRecorder {
           replay.controller.signal,
         );
         this.#assertReplayActive(replay);
-        if (event.kind === "posture") {
-          await handlers.setPosture!(event.posture, replay.controller.signal);
-        } else if (event.kind === "gesture") {
-          await handlers.dispatchGesture(
-            event.gesture,
-            replay.controller.signal,
-          );
-        } else {
+        if (event.kind === "gesture") {
+          const gesture = event.gesture;
+          if (gesture.type === "touch") {
+            const pointer = gesture.pointerId ?? 0;
+            if (gesture.action !== "down" && !pressed.has(pointer)) continue;
+            // Marked before dispatch: a down interrupted mid-dispatch may
+            // already be on the device.
+            if (gesture.action !== "up") pressed.set(pointer, gesture);
+            await handlers.dispatchGesture(gesture, replay.controller.signal);
+            if (gesture.action === "up") pressed.delete(pointer);
+          } else {
+            await handlers.dispatchGesture(gesture, replay.controller.signal);
+          }
+        } else if (event.kind === "location") {
           await handlers.setLocation(
             event.location,
             replay.controller.signal,
           );
+        } else {
+          await handlers.setPosture!(event.posture, replay.controller.signal);
         }
         this.#assertReplayActive(replay);
       }
@@ -492,9 +408,13 @@ export class SessionRecorder {
         outcome = "cancelled";
       } else {
         outcome = "error";
-        this.#lastError = err instanceof Error ? err.message : String(err);
+        this.#lastError = publicErrorMessage(err);
+        // The replay runs after its API response; `lastError` keeps only the
+        // public message, so the detail is logged here.
+        console.error("[session] replay failed:", err);
       }
     } finally {
+      await this.#releasePointers(pressed, handlers);
       if (this.#activeReplay?.id === replay.id) {
         const finishedAt = new Date(this.#clock.now()).toISOString();
         this.#replaying = false;
@@ -507,6 +427,23 @@ export class SessionRecorder {
       }
     }
     return this.snapshot();
+  }
+
+  async #releasePointers(
+    pressed: Map<number, TouchGesture>,
+    handlers: ReplayHandlers,
+  ): Promise<void> {
+    // Runs after cancellation too, so it needs its own (never aborted) signal;
+    // the handlers still refuse to touch a different device session.
+    const signal = new AbortController().signal;
+    for (const gesture of pressed.values()) {
+      try {
+        await handlers.dispatchGesture({ ...gesture, action: "up" }, signal);
+      } catch {
+        // The session ended or changed; its input state went with it.
+      }
+    }
+    pressed.clear();
   }
 
   #assertReplayActive(replay: ActiveReplay): void {
@@ -540,9 +477,9 @@ export class SessionRecorder {
     const recorded: RecordedEvent =
       event.kind === "gesture"
         ? { ...base, kind: "gesture", gesture: cloneGesture(event.gesture) }
-        : event.kind === "posture"
-          ? { ...base, kind: "posture", posture: event.posture }
-          : { ...base, kind: "location", location: { ...event.location } };
+        : event.kind === "location"
+          ? { ...base, kind: "location", location: { ...event.location } }
+          : { ...base, kind: "posture", posture: event.posture };
     const bytes = Buffer.byteLength(JSON.stringify(recorded), "utf8");
     if (EMPTY_ARRAY_BYTES + bytes > this.#maxBytes) {
       this.#droppedEvents++;

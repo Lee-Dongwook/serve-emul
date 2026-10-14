@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { apiRequest } from "../lib/api-client";
+import { apiErrorMessage, apiRequest } from "../lib/api-client";
 import { deviceSessionStore, useDeviceSessionSnapshot } from "../lib/device-session-store";
 import { usePoll } from "../lib/use-poll";
 import type { FoldPosture, FoldableState } from "../../shared/foldable-contracts";
@@ -20,7 +20,7 @@ export function FoldablePanel() {
   const { refresh } = usePoll({
     poll: ({ signal }) => apiRequest("/api/foldable", { method: "GET", signal, cache: "no-store" }),
     onResult: (json, context) => { setResult({ revision: context.key, state: json.foldable }); setError(null); },
-    onError: (err, context) => setError({ revision: context.key, message: err instanceof Error ? err.message : String(err) }),
+    onError: (err, context) => setError({ revision: context.key, message: apiErrorMessage(err) }),
     intervalMs: 2_000,
     pollKey: session.revision,
     enabled: !session.transitioning && !busy,
@@ -36,7 +36,7 @@ export function FoldablePanel() {
       const json = await apiRequest("/api/foldable", { method: "POST", body: { posture } });
       if (deviceSessionStore.getSnapshot().revision === revision) setResult({ revision, state: json.foldable });
     } catch (err) {
-      setActionError({ revision, message: err instanceof Error ? err.message : String(err) });
+      setActionError({ revision, message: apiErrorMessage(err) });
     } finally {
       inFlight.current = false;
       setBusy(null);

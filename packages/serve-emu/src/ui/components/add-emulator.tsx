@@ -1,18 +1,7 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import type { AvdCatalog } from "../../shared/avd-contracts";
+import { apiErrorMessage, apiRequest } from "../lib/api-client";
 import "./add-emulator.css";
-
-function failureMessage(error: unknown, status: number, fallback: string): string {
-  if (status === 404) {
-    return "Emulator creation is unavailable on this server. Restart serve-emu from the updated project, then retry.";
-  }
-  if (typeof error === "string" && error.trim()) return error;
-  if (error && typeof error === "object" && "message" in error &&
-      typeof error.message === "string" && error.message.trim()) {
-    return error.message;
-  }
-  return fallback;
-}
 
 export function AddEmulator({ onCreated }: { onCreated: (name: string) => void }) {
   const [open, setOpen] = useState(false);
@@ -63,15 +52,13 @@ function AddEmulatorDialog({ onClose, onCreated }: {
     setError("");
     void (async () => {
       try {
-        const response = await fetch("/api/avds/catalog", { signal: controller.signal, cache: "no-store" });
-        const json = await response.json() as AvdCatalog & { ok?: boolean; error?: unknown };
-        if (!response.ok || !json.ok) throw new Error(failureMessage(json.error, response.status, "Could not load emulator options."));
+        const json = await apiRequest("/api/avds/catalog", { method: "GET", signal: controller.signal, cache: "no-store" });
         if (controller.signal.aborted) return;
         setCatalog(json);
         setProfile(json.profiles.find((option) => option.id === "pixel_fold")?.id ?? json.profiles[0]?.id ?? "");
         setImage(json.images[0]?.id ?? "");
       } catch (err) {
-        if (!controller.signal.aborted) { setCatalog(null); setError(err instanceof Error ? err.message : String(err)); }
+        if (!controller.signal.aborted) { setCatalog(null); setError(apiErrorMessage(err)); }
       } finally {
         if (!controller.signal.aborted) setLoading(false);
       }
@@ -86,16 +73,13 @@ function AddEmulatorDialog({ onClose, onCreated }: {
     setCreating(true);
     setError("");
     try {
-      const response = await fetch("/api/avds/create", {
+      const json = await apiRequest("/api/avds/create", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: name.trim(), profile, image }),
+        body: { name: name.trim(), profile, image },
       });
-      const json = await response.json() as { ok?: boolean; avd?: string; error?: unknown };
-      if (!response.ok || !json.ok || !json.avd) throw new Error(failureMessage(json.error, response.status, "Could not create emulator."));
       onCreated(json.avd);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(apiErrorMessage(err));
     } finally {
       inFlight.current = false;
       setCreating(false);

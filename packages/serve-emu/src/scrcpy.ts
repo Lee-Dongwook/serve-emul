@@ -1,10 +1,19 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createConnection, type Socket } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { SCRCPY_VERSION, ensureScrcpyServer } from "../scripts/fetch-scrcpy.ts";
-import { execText } from "./exec.ts";
+import {
+  adbCommandFailure,
+  adbOperation,
+  isConnectionClosed,
+  isDeviceUnavailable,
+  runAdb,
+  spawnAdb,
+  terminateChild,
+} from "./adb-command.ts";
+import { CommandFailureError } from "./command-failure.ts";
 
 // Canonical scrcpy wire layouts and upgrade checklist: ../docs/protocol.md
 const DEVICE_JAR_CACHE_PATH =
@@ -32,6 +41,21 @@ export type ScrcpySession = {
   readFrame: () => Promise<VideoPacket | null>;
   close: () => Promise<void>;
 };
+
+/**
+ * Closes a session and logs a failed cleanup instead of rejecting. `close()`
+ * rejects when stopping scrcpy or removing its adb forward fails, and an
+ * unobserved rejection terminates the whole server.
+ */
+export async function closeScrcpySession(
+  session: Pick<ScrcpySession, "serial" | "close">,
+): Promise<void> {
+  try {
+    await session.close();
+  } catch (err) {
+    console.error(`[scrcpy] cleanup failed for ${session.serial}:`, err);
+  }
+}
 
 export type ScrcpyErrorCode =
   | "clean-eof"
@@ -110,9 +134,10 @@ const DEFAULT_TIMEOUTS: ScrcpyTimeouts = {
   cleanupMs: 3_000,
 };
 
-// exec.ts holds its concurrency slot for up to one second while reaping a
-// process killed by AbortSignal. Wait slightly longer before starting cleanup
-// so an outcome-ambiguous ADB mutation cannot complete after rollback.
+// On abort, exec.ts SIGKILLs the adb process but settles the call only once
+// that process has closed, with no time bound. Wait up to this long for it
+// before starting cleanup, so an outcome-ambiguous ADB mutation normally ends
+// before rollback; one that takes longer is left to finish on its own.
 const ADB_CANCELLATION_SETTLE_MS = 1_100;
 
 // Single source of truth for encoder defaults; the CLI reads these for its
@@ -176,17 +201,9 @@ function runtimeFor(deps: ScrcpyDependencies): ScrcpyRuntime {
         createHash("sha256").update(await readFile(path)).digest("hex")),
     runAdb:
       deps.runAdb ??
-      (async (serial, args, opts) =>
-        execText("adb", ["-s", serial, ...args], {
-          timeout: opts.timeoutMs,
-          signal: opts.signal,
-        })),
-    spawnAdb:
-      deps.spawnAdb ??
-      ((serial, args) =>
-        spawn("adb", ["-s", serial, ...args], {
-          stdio: ["ignore", "pipe", "pipe"],
-        })),
+      ((serial, args, opts) =>
+        runAdb(serial, args, { timeout: opts.timeoutMs, signal: opts.signal })),
+    spawnAdb: deps.spawnAdb ?? ((serial, args) => spawnAdb(serial, args)),
     connect: deps.connect ?? connectOnce,
     sleep:
       deps.sleep ??
@@ -205,6 +222,8 @@ async function withDeadline<T>(
   label: string,
   operation: (signal: AbortSignal) => Promise<T>,
   settleAfterAbortMs = 0,
+  timeoutError: () => Error = () =>
+    new Error(`${label} timed out after ${timeoutMs}ms`),
 ): Promise<T> {
   const controller = new AbortController();
   const abortFromParent = () =>
@@ -212,7 +231,7 @@ async function withDeadline<T>(
   parentSignal?.addEventListener("abort", abortFromParent, { once: true });
   if (parentSignal?.aborted) abortFromParent();
   const timer = runtime.setTimer(
-    () => controller.abort(new Error(`${label} timed out after ${timeoutMs}ms`)),
+    () => controller.abort(timeoutError()),
     timeoutMs,
   );
 
@@ -257,23 +276,20 @@ async function withDeadline<T>(
   }
 }
 
+/**
+ * A scrcpy startup step's adb failure. Its arguments (the host jar path for
+ * `push`) and output stay in `message` for the server log; API responses only
+ * name the subcommand.
+ */
 function commandFailure(
   serial: string,
   args: string[],
   result: AdbCommandResult,
-): Error {
-  const detail =
-    result.stderr?.trim() ||
-    result.stdout?.trim() ||
-    result.error?.message ||
-    (result.timedOut ? "timed out" : `status ${result.status}`);
-  return new Error(`adb -s ${serial} ${args.join(" ")} failed: ${detail}`);
-}
-
-function deviceUnavailable(result: AdbCommandResult): boolean {
-  const detail = `${result.stderr ?? ""} ${result.stdout ?? ""}`;
-  return /\b(?:device offline|device .* not found|no devices?|closed)\b/i.test(
-    detail,
+): CommandFailureError {
+  return adbCommandFailure(
+    adbOperation(args),
+    result,
+    `adb -s ${serial} ${args.join(" ")}`,
   );
 }
 
@@ -292,6 +308,12 @@ async function runAdbRaw(
     (commandSignal) =>
       runtime.runAdb(serial, args, { timeoutMs, signal: commandSignal }),
     ADB_CANCELLATION_SETTLE_MS,
+    () =>
+      new CommandFailureError(
+        "adb-timeout",
+        `${adbOperation(args)} timed out`,
+        `adb -s ${serial} ${args.join(" ")} timed out after ${timeoutMs}ms`,
+      ),
   );
 }
 
@@ -353,6 +375,10 @@ async function forwardAbstractSocket(
     }
   }
 
+  // A lost device fails every fixed port the same way: report it at once.
+  if (isDeviceUnavailable(dynamic)) {
+    throw commandFailure(serial, dynamicArgs, dynamic);
+  }
   let lastError =
     dynamic.stderr?.trim() ||
     dynamic.error?.message ||
@@ -374,9 +400,16 @@ async function forwardAbstractSocket(
       signal,
     );
     if (fixed.status === 0) return port;
+    if (isDeviceUnavailable(fixed)) {
+      throw commandFailure(serial, fixedArgs, fixed);
+    }
     lastError = fixed.stderr?.trim() || fixed.error?.message || lastError;
   }
-  throw new Error(`Failed to create adb forward for ${target}: ${lastError}`);
+  throw new CommandFailureError(
+    "adb-failed",
+    "adb forward failed",
+    `${target}: ${lastError}`,
+  );
 }
 
 async function removeForwards(
@@ -401,7 +434,7 @@ async function removeForwards(
       for (const port of forwardedPorts(listed.stdout, serial, target)) {
         ports.add(port);
       }
-    } else if (!deviceUnavailable(listed)) {
+    } else if (!isDeviceUnavailable(listed)) {
       errors.push(
         commandFailure(serial, ["forward", "--list"], listed),
       );
@@ -422,7 +455,7 @@ async function removeForwards(
       );
       if (
         result.status !== 0 &&
-        !deviceUnavailable(result) &&
+        !isDeviceUnavailable(result) &&
         !/(?:cannot remove listener|listener .* not found)/i.test(
           result.stderr ?? "",
         )
@@ -448,22 +481,34 @@ type DeviceJarPaths = {
   working: string;
 };
 
+/** True when `sha256sum <cache>` printed exactly the local jar's digest. */
+function cacheMatches(probe: AdbCommandResult, fingerprint: string): boolean {
+  if (probe.status !== 0) return false;
+  const digest = probe.stdout.trim().split(/\s+/, 1)[0] ?? "";
+  return digest.toLowerCase() === fingerprint.toLowerCase();
+}
+
 async function prepareDeviceServerJar(
   runtime: ScrcpyRuntime,
   timeouts: ScrcpyTimeouts,
   serial: string,
   localJar: string,
+  fingerprint: string,
   paths: DeviceJarPaths,
   signal: AbortSignal,
 ): Promise<void> {
+  // Reuse the cache only if its bytes are exactly the local jar. A file under
+  // the cache name can still be empty or truncated: a hard emulator stop
+  // after the rename can lose data that was never flushed (#121). A device
+  // without sha256sum simply re-pushes.
   const probe = await runAdbRaw(
     runtime,
     serial,
-    ["shell", "test", "-f", paths.cache],
+    ["shell", "sha256sum", paths.cache],
     timeouts.copyMs,
     signal,
   );
-  if (probe.status !== 0) {
+  if (!cacheMatches(probe, fingerprint)) {
     await runAdbChecked(
       runtime,
       serial,
@@ -471,10 +516,25 @@ async function prepareDeviceServerJar(
       timeouts.pushMs,
       signal,
     );
+    // Flush the pushed bytes before the rename publishes them under the
+    // cache name. Best effort: a slow or failed sync must not fail a start
+    // whose push succeeded, and the sha256 check repairs a bad cache entry on
+    // the next start. An abort still stops startup.
+    try {
+      await runAdbChecked(
+        runtime,
+        serial,
+        ["shell", "sync"],
+        timeouts.copyMs,
+        signal,
+      );
+    } catch (error) {
+      if (signal?.aborted) throw error;
+    }
     await runAdbChecked(
       runtime,
       serial,
-      ["shell", "mv", paths.temporary, paths.cache],
+      ["shell", "mv", "-f", paths.temporary, paths.cache],
       timeouts.copyMs,
       signal,
     );
@@ -508,11 +568,11 @@ async function removeWorkingJars(
     // ADB occasionally closes the first shell channel immediately after the
     // long-running app_process channel exits. `rm -f` is idempotent, so retry
     // once to distinguish that transport race from a real cleanup failure.
-    if (attempt === 0 && /\bclosed\b/i.test(result.stderr ?? "")) {
+    if (attempt === 0 && isConnectionClosed(result)) {
       await runtime.sleep(100, cleanupController.signal);
       continue;
     }
-    if (deviceUnavailable(result)) return;
+    if (isDeviceUnavailable(result)) return;
     throw commandFailure(serial, args, result);
   }
 }
@@ -524,6 +584,7 @@ async function waitForAbstractSocketAsync(
   name: string,
   signal: AbortSignal,
 ): Promise<void> {
+  let closedBefore = false;
   while (true) {
     throwIfAborted(signal, `waiting for @${name} aborted`);
     const result = await runAdbRaw(
@@ -534,14 +595,19 @@ async function waitForAbstractSocketAsync(
       signal,
     );
     if (result.status === 0 && result.stdout.includes(`@${name}`)) return;
-    const detail = `${result.stderr ?? ""} ${result.stdout ?? ""}`;
-    if (/\b(offline|unauthorized|not found|no devices?)\b/i.test(detail)) {
+    // Only a failed poll can say the device is gone: a successful one's
+    // stdout is the socket table. A single `closed` is the transport race
+    // removeWorkingJars also retries, so only a repeated one fails startup.
+    const failed = result.status !== 0;
+    const closed = failed && isConnectionClosed(result);
+    if (failed && isDeviceUnavailable(result) && (!closed || closedBefore)) {
       throw commandFailure(
         serial,
         ["shell", "cat", "/proc/net/unix"],
         result,
       );
     }
+    closedBefore = closed;
     await runtime.sleep(100, signal);
   }
 }
@@ -939,46 +1005,26 @@ export async function startScrcpy(
     try {
       controlSock?.destroy();
     } catch {}
-    try {
-      proc?.kill("SIGTERM");
-    } catch {}
-
-    const child = proc;
+    // SIGTERM goes out now; the cleanup below waits for the exit (escalating
+    // to SIGKILL) before removing forwards and jars.
+    const stopping =
+      proc && !childSettled
+        ? terminateChild(proc, {
+            exited: childDone,
+            graceMs: timeouts.processExitMs,
+            label: "scrcpy process",
+            setTimer: runtime.setTimer,
+            clearTimer: runtime.clearTimer,
+          })
+        : null;
     const paths = jarPaths;
     closeTask = (async () => {
       const cleanupErrors: unknown[] = [];
-      if (child && !childSettled) {
+      if (stopping) {
         try {
-          await withDeadline(
-            runtime,
-            undefined,
-            timeouts.processExitMs,
-            "scrcpy process exit",
-            () => childDone,
-          );
-        } catch (termWaitError) {
-          let killError: unknown = null;
-          try {
-            child.kill("SIGKILL");
-          } catch (err) {
-            killError = err;
-          }
-          try {
-            await withDeadline(
-              runtime,
-              undefined,
-              timeouts.processExitMs,
-              "scrcpy process reap",
-              () => childDone,
-            );
-          } catch (reapError) {
-            cleanupErrors.push(
-              new AggregateError(
-                [termWaitError, ...(killError ? [killError] : []), reapError],
-                "scrcpy process did not exit during cleanup",
-              ),
-            );
-          }
+          await stopping;
+        } catch (error) {
+          cleanupErrors.push(error);
         }
       }
       const cleanupResults = await Promise.allSettled([
@@ -1038,6 +1084,7 @@ export async function startScrcpy(
       timeouts,
       serial,
       jar,
+      fingerprint,
       jarPaths,
       startupController.signal,
     );
@@ -1089,10 +1136,13 @@ export async function startScrcpy(
         settle(new Error(`scrcpy process failed during startup: ${err.message}`)),
       );
       proc!.once("exit", (code, signal) => {
-        const suffix = stderrTail.trim() ? `: ${stderrTail.trim()}` : "";
+        // The server's stderr (often a Java stack trace) is echoed to our
+        // stderr and kept in the message, but stays out of the public message.
         settle(
-          new Error(
-            `scrcpy process exited during startup (code=${code ?? "null"}, signal=${signal ?? "none"})${suffix}`,
+          new CommandFailureError(
+            "adb-failed",
+            `scrcpy process exited during startup (code=${code ?? "null"}, signal=${signal ?? "none"})`,
+            stderrTail.trim() || undefined,
           ),
         );
       });
@@ -1127,6 +1177,11 @@ export async function startScrcpy(
       "connecting scrcpy video socket",
       (signal) => runtime.connect(localPort!, timeouts.connectMs, signal),
     );
+    // Listen before the next await. Bun drops socket data that arrives while
+    // no `data` listener is attached (#162), and scrcpy writes to the video
+    // socket early: the dummy byte on accept, and the device name as soon as
+    // it accepts the control socket, which can be before this side resumes.
+    const reader = new FramedReader(videoSock);
     throwIfAborted(startupController.signal, "scrcpy startup aborted");
     controlSock = await withDeadline(
       runtime,
@@ -1138,7 +1193,6 @@ export async function startScrcpy(
     throwIfAborted(startupController.signal, "scrcpy startup aborted");
     controlSock.on("data", () => {});
 
-    const reader = new FramedReader(videoSock);
     const preambleBytes = await withDeadline(
       runtime,
       startupController.signal,

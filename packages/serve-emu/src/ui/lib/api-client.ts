@@ -21,8 +21,25 @@ export type ApiRequestOptions<
   P extends ApiClientPath,
   M extends ApiMethod<P>,
 > = Omit<RequestInit, "body" | "method"> &
-  { method: M } &
+  {
+    method: M;
+    /** Appended as a query string; the path still selects the parser. */
+    query?: Record<string, string | number | undefined>;
+  } &
   RequestBodyOption<ApiRequest<P, M>>;
+
+function withQuery(
+  path: string,
+  query: Record<string, string | number | undefined> | undefined,
+): string {
+  if (!query) return path;
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined) params.set(key, String(value));
+  }
+  const search = params.toString();
+  return search ? `${path}?${search}` : path;
+}
 
 export type FetchLike = (
   input: RequestInfo | URL,
@@ -39,7 +56,6 @@ type ApiClientErrorOptions = {
 export type ApiClientErrorCode =
   | ApiErrorCode
   | "invalid_response"
-  | "legacy_error"
   | "http_error"
   | "network_error";
 
@@ -65,11 +81,6 @@ function isAbortError(value: unknown): boolean {
   return isRecord(value) && value.name === "AbortError";
 }
 
-function legacyFailureMessage(value: unknown): string | null {
-  if (!isRecord(value) || value.ok !== false || typeof value.error !== "string") return null;
-  return value.error;
-}
-
 function requestBody(body: unknown, headers: Headers): BodyInit | undefined {
   if (body === undefined) return undefined;
   if (body instanceof FormData) return body;
@@ -87,11 +98,11 @@ export function createApiClient(fetcher: FetchLike = globalThis.fetch) {
     path: P,
     options: ApiRequestOptions<P, M>,
   ): Promise<ApiSuccessResponse<P, M>> {
-    const { body, method, ...requestOptions } = options;
+    const { body, method, query, ...requestOptions } = options;
     const headers = new Headers(requestOptions.headers);
     let response: Response;
     try {
-      response = await fetcher(path, {
+      response = await fetcher(withQuery(path, query), {
         ...requestOptions,
         method,
         headers,
@@ -134,17 +145,6 @@ export function createApiClient(fetcher: FetchLike = globalThis.fetch) {
       });
     }
 
-    // Keep the client usable during rolling upgrades from the original
-    // `{ ok: false, error: string }` response shape.
-    const legacyMessage = legacyFailureMessage(payload);
-    if (legacyMessage !== null) {
-      throw new ApiClientError(legacyMessage, {
-        status: response.status,
-        code: "legacy_error",
-        payload,
-      });
-    }
-
     let parsed: ApiResponse<P, M>;
     try {
       parsed = parseApiResponse(path, method, payload);
@@ -181,3 +181,8 @@ export function createApiClient(fetcher: FetchLike = globalThis.fetch) {
 }
 
 export const apiRequest = createApiClient();
+
+/** A display string for any failure: client errors already carry one. */
+export function apiErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

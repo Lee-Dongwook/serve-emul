@@ -1,15 +1,4 @@
-import {
-  getFontScale,
-  getNetworkStatus,
-  getNightMode,
-  getUserRotation,
-  setFontScale,
-  setNetworkEnabled,
-  setNightMode,
-  setUserRotation,
-  type NightMode,
-  type OrientationMode,
-} from "../../adb.ts";
+import type { NightMode, OrientationMode } from "../../shared/api-contracts.ts";
 import type { ApiDependencies } from "../dependencies.ts";
 import type { ApiRoute } from "../router.ts";
 
@@ -138,11 +127,14 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
           const avd = (payload as Record<string, unknown>).avd;
           if (typeof avd !== "string" || !avd.trim())
             throw new Error("avd is required");
+          // A client that gives up during a long cold boot does not cancel it:
+          // agents often time out first and pick the emulator up later. The
+          // server owns the launch and stops it when it stops.
           const launch = await launchEmulator({ avd: avd.trim() });
           try {
             sessions.assertPublished(requestContext);
           } catch (err) {
-            launch.stop();
+            await launch.stop();
             throw err;
           }
           const select = (payload as Record<string, unknown>).select !== false;
@@ -151,7 +143,7 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
               const switched = await switchSession(launch.serial);
               return Response.json({ ...switched, avd: avd.trim() });
             } catch (err) {
-              launch.stop();
+              await launch.stop();
               throw err;
             }
           }
@@ -175,7 +167,6 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
           requestContext,
           listActiveAvds,
           sessions,
-          stopCurrentSession,
           killEmulator,
           errorResponse,
         } = deps;
@@ -206,10 +197,9 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
           if (!/^emulator-\d+$/.test(serial))
             throw new Error(`${serial} is not an emulator`);
           if (serial === requestContext.serial) {
-            await stopCurrentSession(
-              requestContext,
-              "current emulator stopped",
-            );
+            await sessions.stop(requestContext, "current emulator stopped", {
+              byClient: true,
+            });
           }
           await killEmulator(serial);
           sessions.assertPublished(requestContext);
@@ -222,13 +212,16 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
     {
       method: "GET",
       path: "/api/orientation",
-      handler: async ({ deps }) => {
-        const { runForContext, requestContext, errorResponse } = deps;
+      handler: async ({ request: req, deps }) => {
+        const { runForContext, requestContext, errorResponse, device } = deps;
         try {
           return Response.json({
             ok: true,
-            orientation: await runForContext(requestContext, (context) =>
-              getUserRotation(context.serial),
+            orientation: await runForContext(
+              requestContext,
+              (context, signal) =>
+                device.orientation(context.serial, signal),
+              req.signal,
             ),
           });
         } catch (err) {
@@ -246,6 +239,7 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
           errorResponse,
           readJsonBody,
           MAX_JSON_BODY_BYTES,
+          device,
         } = deps;
         try {
           const payload = await readJsonBody(
@@ -270,8 +264,11 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
           }
           return Response.json({
             ok: true,
-            orientation: await runForContext(requestContext, (context) =>
-              setUserRotation(context.serial, orientation as OrientationMode),
+            orientation: await runForContext(
+              requestContext,
+              (context, signal) =>
+                device.setOrientation(context.serial, orientation as OrientationMode, signal),
+              req.signal,
             ),
           });
         } catch (err) {
@@ -282,13 +279,16 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
     {
       method: "GET",
       path: "/api/night-mode",
-      handler: async ({ deps }) => {
-        const { runForContext, requestContext, errorResponse } = deps;
+      handler: async ({ request: req, deps }) => {
+        const { runForContext, requestContext, errorResponse, device } = deps;
         try {
           return Response.json({
             ok: true,
-            nightMode: await runForContext(requestContext, (context) =>
-              getNightMode(context.serial),
+            nightMode: await runForContext(
+              requestContext,
+              (context, signal) =>
+                device.nightMode(context.serial, signal),
+              req.signal,
             ),
           });
         } catch (err) {
@@ -306,6 +306,7 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
           errorResponse,
           readJsonBody,
           MAX_JSON_BODY_BYTES,
+          device,
         } = deps;
         try {
           const payload = await readJsonBody(
@@ -326,8 +327,11 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
           }
           return Response.json({
             ok: true,
-            nightMode: await runForContext(requestContext, (context) =>
-              setNightMode(context.serial, mode as NightMode),
+            nightMode: await runForContext(
+              requestContext,
+              (context, signal) =>
+                device.setNightMode(context.serial, mode as NightMode, signal),
+              req.signal,
             ),
           });
         } catch (err) {
@@ -338,13 +342,16 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
     {
       method: "GET",
       path: "/api/font-scale",
-      handler: async ({ deps }) => {
-        const { runForContext, requestContext, errorResponse } = deps;
+      handler: async ({ request: req, deps }) => {
+        const { runForContext, requestContext, errorResponse, device } = deps;
         try {
           return Response.json({
             ok: true,
-            fontScale: await runForContext(requestContext, (context) =>
-              getFontScale(context.serial),
+            fontScale: await runForContext(
+              requestContext,
+              (context, signal) =>
+                device.fontScale(context.serial, signal),
+              req.signal,
             ),
           });
         } catch (err) {
@@ -362,6 +369,7 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
           errorResponse,
           readJsonBody,
           MAX_JSON_BODY_BYTES,
+          device,
         } = deps;
         try {
           const payload = await readJsonBody(
@@ -382,8 +390,11 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
           }
           return Response.json({
             ok: true,
-            fontScale: await runForContext(requestContext, (context) =>
-              setFontScale(context.serial, scale),
+            fontScale: await runForContext(
+              requestContext,
+              (context, signal) =>
+                device.setFontScale(context.serial, scale, signal),
+              req.signal,
             ),
           });
         } catch (err) {
@@ -394,13 +405,16 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
     {
       method: "GET",
       path: "/api/network",
-      handler: async ({ deps }) => {
-        const { runForContext, requestContext, errorResponse } = deps;
+      handler: async ({ request: req, deps }) => {
+        const { runForContext, requestContext, errorResponse, device } = deps;
         try {
           return Response.json({
             ok: true,
-            network: await runForContext(requestContext, (context) =>
-              getNetworkStatus(context.serial),
+            network: await runForContext(
+              requestContext,
+              (context, signal) =>
+                device.network(context.serial, signal),
+              req.signal,
             ),
           });
         } catch (err) {
@@ -418,6 +432,7 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
           errorResponse,
           readJsonBody,
           MAX_JSON_BODY_BYTES,
+          device,
         } = deps;
         try {
           const payload = await readJsonBody(
@@ -438,8 +453,11 @@ export function deviceRoutes(): ApiRoute<ApiDependencies>[] {
           }
           return Response.json({
             ok: true,
-            network: await runForContext(requestContext, (context) =>
-              setNetworkEnabled(context.serial, enabled),
+            network: await runForContext(
+              requestContext,
+              (context, signal) =>
+                device.setNetwork(context.serial, enabled, signal),
+              req.signal,
             ),
           });
         } catch (err) {

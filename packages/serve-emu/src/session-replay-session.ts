@@ -7,7 +7,6 @@ import {
 } from "./session-recorder.ts";
 
 type SessionReplayHandlersOpts = {
-  setPosture?: (posture: FoldPosture, signal: AbortSignal) => Promise<void> | void;
   generation: number;
   getGeneration: () => number;
   dispatchGesture: (
@@ -15,6 +14,7 @@ type SessionReplayHandlersOpts = {
     signal: AbortSignal,
   ) => Promise<void> | void;
   setLocation: (fix: GeoFix, signal: AbortSignal) => Promise<void> | void;
+  setPosture?: (posture: FoldPosture, signal: AbortSignal) => Promise<void> | void;
 };
 
 function abortReason(signal: AbortSignal): Error {
@@ -35,12 +35,8 @@ export function createSessionReplayHandlers(
     }
   };
 
+  const setPosture = opts.setPosture;
   return {
-    ...(opts.setPosture ? { setPosture: async (posture: FoldPosture, signal: AbortSignal) => {
-      assertCurrent(signal);
-      await opts.setPosture!(posture, signal);
-      assertCurrent(signal);
-    } } : {}),
     dispatchGesture: async (gesture, signal) => {
       assertCurrent(signal);
       await opts.dispatchGesture(gesture, signal);
@@ -51,5 +47,12 @@ export function createSessionReplayHandlers(
       await opts.setLocation(fix, signal);
       assertCurrent(signal);
     },
+    ...(setPosture && {
+      setPosture: async (posture: FoldPosture, signal: AbortSignal) => {
+        assertCurrent(signal);
+        await setPosture(posture, signal);
+        assertCurrent(signal);
+      },
+    }),
   };
 }

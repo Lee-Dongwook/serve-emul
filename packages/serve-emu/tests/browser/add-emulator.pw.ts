@@ -43,12 +43,11 @@ test("creates a foldable from the Devices panel, refreshes the grid, and preserv
   await expect(page.getByRole("button", { name: "Add emulator", exact: true })).toBeFocused();
 });
 
-for (const structured of [false, true]) {
-test(`missing tools can be retried (${structured ? "structured" : "legacy"} error); Escape returns focus`, async ({ page }) => {
+test("missing tools can be retried; Escape returns focus", async ({ page }) => {
   let retry = false;
   await page.route("**/api/avds/catalog", (route) => route.fulfill(retry
     ? { json: { ...catalog, images: [] } }
-    : { status: 503, json: { ok: false, error: structured ? { code: "service_unavailable", message: "Install Android SDK Command-line Tools" } : "Install Android SDK Command-line Tools" } }));
+    : { status: 503, json: { ok: false, error: { code: "service_unavailable", message: "Install Android SDK Command-line Tools" } } }));
   await page.goto("/");
   const trigger = page.getByRole("button", { name: "Add emulator", exact: true });
   await trigger.click();
@@ -64,10 +63,7 @@ test(`missing tools can be retried (${structured ? "structured" : "legacy"} erro
   await expect(trigger).toBeFocused();
 });
 
-}
-
-for (const structured of [false, true]) {
-test(`creation error retains input and prevents duplicate submission (${structured ? "structured" : "legacy"})`, async ({ page }) => {
+test("creation error retains input and prevents duplicate submission", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.route("**/api/avds/catalog", (route) => route.fulfill({ json: catalog }));
   let calls = 0;
@@ -76,7 +72,7 @@ test(`creation error retains input and prevents duplicate submission (${structur
   await page.route("**/api/avds/create", async (route) => {
     calls++;
     await pending;
-    await route.fulfill({ status: 409, json: { ok: false, error: structured ? { code: "conflict", message: "An emulator named My_Fold already exists." } : "An emulator named My_Fold already exists." } });
+    await route.fulfill({ status: 409, json: { ok: false, error: { code: "conflict", message: "An emulator named My_Fold already exists." } } });
   });
   await page.goto("/");
   await page.getByRole("button", { name: "Add emulator", exact: true }).click();
@@ -93,15 +89,4 @@ test(`creation error retains input and prevents duplicate submission (${structur
   const box = await dialog.boundingBox();
   expect(box!.x).toBeGreaterThanOrEqual(0);
   expect(box!.x + box!.width).toBeLessThanOrEqual(390);
-});
-
-}
-
-test("older server gives restart guidance instead of object coercion", async ({ page }) => {
-  await page.route("**/api/avds/catalog", (route) => route.fulfill({ status: 404, json: { ok: false, error: { code: "not_found", message: "API route not found" } } }));
-  await page.goto("/");
-  await page.getByRole("button", { name: "Add emulator", exact: true }).click();
-  const alert = page.getByRole("dialog").getByRole("alert");
-  await expect(alert).toContainText("Restart serve-emu from the updated project");
-  await expect(alert).not.toContainText("[object Object]");
 });

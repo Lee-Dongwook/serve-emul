@@ -5,33 +5,79 @@ import type { ApiRoute } from "../router.ts";
 export function foldableRoutes(): ApiRoute<ApiDependencies>[] {
   return [
     {
-      method: "GET", path: "/api/foldable",
-      handler: async ({ deps }) => {
+      method: "GET",
+      path: "/api/foldable",
+      handler: async ({ request: req, deps }) => {
+        const { runForContext, requestContext, errorResponse, device } = deps;
         try {
-          const foldable = await deps.runForContext(deps.requestContext, (context) =>
-            deps.getFoldableState(context.serial, context.signal));
-          return Response.json({ ok: true, foldable });
-        } catch (err) { return deps.errorResponse(err); }
+          return Response.json({
+            ok: true,
+            foldable: await runForContext(
+              requestContext,
+              (context, signal) => device.foldable(context.serial, signal),
+              req.signal,
+            ),
+          });
+        } catch (err) {
+          return errorResponse(err);
+        }
       },
     },
     {
-      method: "POST", path: "/api/foldable",
-      handler: async ({ request, deps }) => {
+      method: "POST",
+      path: "/api/foldable",
+      handler: async ({ request: req, deps }) => {
+        const {
+          runForContext,
+          requestContext,
+          errorResponse,
+          readJsonBody,
+          MAX_JSON_BODY_BYTES,
+          sessions,
+          device,
+        } = deps;
         try {
-          const payload = await deps.readJsonBody(request, deps.MAX_JSON_BODY_BYTES, deps.requestContext);
-          if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("foldable payload must be an object");
-          const body = payload as Record<string, unknown>;
-          if (!isFoldPosture(body.posture)) throw new Error("posture must be folded, half-open, or unfolded");
-          if (body.record !== undefined && typeof body.record !== "boolean") throw new Error("record must be a boolean");
-          const posture = body.posture;
-          const foldable = await deps.runForContext(deps.requestContext, async (context) => {
-            const result = await deps.setFoldPosture(context.serial, posture, context.signal);
-            deps.sessions.assertCurrent(context);
-            if (body.record !== false) context.recorder.recordPosture(posture, "api:foldable");
-            return result;
+          const payload = await readJsonBody(
+            req,
+            MAX_JSON_BODY_BYTES,
+            requestContext,
+          );
+          if (
+            typeof payload !== "object" ||
+            payload === null ||
+            Array.isArray(payload)
+          ) {
+            throw new Error("foldable payload must be an object");
+          }
+          const { posture, record } = payload as Record<string, unknown>;
+          if (!isFoldPosture(posture)) {
+            throw new Error("posture must be folded, half-open, or unfolded");
+          }
+          if (record !== undefined && typeof record !== "boolean") {
+            throw new Error("record must be a boolean");
+          }
+          return Response.json({
+            ok: true,
+            foldable: await runForContext(
+              requestContext,
+              async (context, signal) => {
+                const result = await device.setFoldPosture(
+                  context.serial,
+                  posture,
+                  signal,
+                );
+                sessions.assertCurrent(context);
+                if (record !== false) {
+                  context.recorder.recordPosture(posture, "rest:foldable");
+                }
+                return result;
+              },
+              req.signal,
+            ),
           });
-          return Response.json({ ok: true, foldable });
-        } catch (err) { return deps.errorResponse(err); }
+        } catch (err) {
+          return errorResponse(err);
+        }
       },
     },
   ];

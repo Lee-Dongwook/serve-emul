@@ -69,7 +69,7 @@ export function sessionRoutes(): ApiRoute<ApiDependencies>[] {
           errorResponse,
           sessions,
           enqueueGesture,
-          setLocation,
+          applyLocation,
         } = deps;
         const replayRecorder = requestContext.recorder;
         const replayAdmissionEpoch = replayRecorder.replayAdmissionEpoch;
@@ -85,7 +85,7 @@ export function sessionRoutes(): ApiRoute<ApiDependencies>[] {
           return err instanceof SessionChangedError ||
             err instanceof HttpBodyError
             ? errorResponse(err)
-            : sessionReplayErrorResponse(err, 400);
+            : sessionReplayErrorResponse(err, "invalid_request");
         }
         const isCurrentReplaySession = () =>
           replayAdmissionEpoch === replayRecorder.replayAdmissionEpoch &&
@@ -95,7 +95,11 @@ export function sessionRoutes(): ApiRoute<ApiDependencies>[] {
           generation: requestContext.generation,
           getGeneration: () => sessions.current.generation,
           setPosture: async (posture, signal) => {
-            await deps.setFoldPosture(requestContext.serial, posture, signal);
+            await deps.device.setFoldPosture(
+              requestContext.serial,
+              posture,
+              AbortSignal.any([signal, requestContext.signal]),
+            );
           },
           dispatchGesture: (gesture) =>
             enqueueGesture(
@@ -105,17 +109,18 @@ export function sessionRoutes(): ApiRoute<ApiDependencies>[] {
               false,
             ).completion.then(() => {}),
           setLocation: async (fix, signal) => {
-            requestContext.route.stop();
-            await setLocation(requestContext.serial, fix, signal);
-            if (!isCurrentReplaySession()) {
-              throw new SessionReplayConflictError(
-                "device session changed during session replay",
-              );
-            }
-            requestContext.lastLocation = {
-              ...fix,
-              appliedAt: new Date().toISOString(),
-            };
+            await applyLocation(requestContext, fix, {
+              source: "session:replay",
+              record: false,
+              signal,
+              ensureCurrent: () => {
+                if (!isCurrentReplaySession()) {
+                  throw new SessionReplayConflictError(
+                    "device session changed during session replay",
+                  );
+                }
+              },
+            });
           },
         });
         return startSessionReplayResponse(

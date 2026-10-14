@@ -1,12 +1,28 @@
 import { existsSync, readdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { execText } from "./exec.ts";
 
 import type { AvdProfile, AvdSystemImage, AvdCatalog, CreateAvdOptions } from "./shared/avd-contracts.ts";
 
+export type AvdManagerErrorCode =
+  | "invalid"
+  | "busy"
+  | "exists"
+  | "tools-unavailable"
+  | "command-failed";
+
+/**
+ * `publicMessage` is safe to send to API clients; SDK tool output stays in
+ * `message` for the server log.
+ */
 export class AvdManagerError extends Error {
-  constructor(message: string, public readonly status = 400) {
-    super(message);
+  constructor(
+    readonly code: AvdManagerErrorCode,
+    readonly publicMessage: string,
+    detail?: string,
+  ) {
+    super(detail ? `${publicMessage}: ${detail}` : publicMessage);
+    this.name = "AvdManagerError";
   }
 }
 
@@ -45,7 +61,7 @@ function resolveTools(deps: Dependencies) {
     const sdkmanager = join(bin, "sdkmanager");
     if (existsSync(avdmanager) && existsSync(sdkmanager)) return { avdmanager, sdkmanager };
   }
-  throw new AvdManagerError(SETUP_HELP, 503);
+  throw new AvdManagerError("tools-unavailable", SETUP_HELP);
 }
 
 async function runTool(
@@ -54,6 +70,7 @@ async function runTool(
   deps: Dependencies,
   timeout = 30_000,
 ): Promise<string> {
+  const operation = `${basename(command)} ${args.slice(0, 2).join(" ")}`;
   const result = await (deps.execText ?? execText)(command, args, {
     timeout,
     maxBuffer: 2 * 1024 * 1024,
@@ -61,7 +78,11 @@ async function runTool(
   });
   if (result.status !== 0 || result.error) {
     const detail = (result.stderr.trim() || result.error?.message || result.stdout.trim()).slice(0, 2000);
-    throw new AvdManagerError(`Android SDK command failed: ${detail || "unknown error"}. ${SETUP_HELP}`, 503);
+    throw new AvdManagerError(
+      "command-failed",
+      `Android SDK command ${operation} failed. ${SETUP_HELP}`,
+      detail || "unknown error",
+    );
   }
   return result.stdout;
 }
@@ -110,21 +131,31 @@ async function loadCatalog(tools: ReturnType<typeof resolveTools>, deps: Depende
   };
 }
 
+export type AvdManager = {
+  catalog(): Promise<AvdCatalog>;
+  create(options: unknown): Promise<{ name: string }>;
+};
+
+export const avdManager: AvdManager = {
+  catalog: () => getAvdCatalog(),
+  create: (options) => createAvd(options),
+};
+
 export async function getAvdCatalog(deps: Dependencies = {}): Promise<AvdCatalog> {
   return loadCatalog(resolveTools(deps), deps);
 }
 
 function validateOptions(value: unknown): CreateAvdOptions {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new AvdManagerError("Create payload must be an object.");
+    throw new AvdManagerError("invalid", "Create payload must be an object.");
   }
   const { name, profile, image } = value as Record<string, unknown>;
   if (typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(name)) {
-    throw new AvdManagerError("Name must be 1–80 letters, numbers, underscores or hyphens, starting with a letter or number.");
+    throw new AvdManagerError("invalid", "Name must be 1–80 letters, numbers, underscores or hyphens, starting with a letter or number.");
   }
   if (typeof profile !== "string" || !profile || profile.length > 200 ||
       typeof image !== "string" || !image || image.length > 300) {
-    throw new AvdManagerError("Choose a hardware profile and an installed system image.");
+    throw new AvdManagerError("invalid", "Choose a hardware profile and an installed system image.");
   }
   return { name, profile, image };
 }
@@ -133,20 +164,22 @@ function validateOptions(value: unknown): CreateAvdOptions {
 let creating = false;
 export async function createAvd(value: unknown, deps: Dependencies = {}): Promise<{ name: string }> {
   const options = validateOptions(value);
-  if (creating) throw new AvdManagerError("An emulator is already being created. Try again when it finishes.", 409);
+  if (creating) {
+    throw new AvdManagerError("busy", "An emulator is already being created. Try again when it finishes.");
+  }
   creating = true;
   try {
     const tools = resolveTools(deps);
     const catalog = await loadCatalog(tools, deps);
     if (!catalog.profiles.some((profile) => profile.id === options.profile)) {
-      throw new AvdManagerError("Unknown hardware profile. Refresh the available options.");
+      throw new AvdManagerError("invalid", "Unknown hardware profile. Refresh the available options.");
     }
     if (!catalog.images.some((image) => image.id === options.image)) {
-      throw new AvdManagerError("Choose an installed system image compatible with this computer.");
+      throw new AvdManagerError("invalid", "Choose an installed system image compatible with this computer.");
     }
     const names = await runTool(tools.avdmanager, ["list", "avd", "-c"], deps);
     if (names.split(/\r?\n/).some((name) => name.trim().toLowerCase() === options.name.toLowerCase())) {
-      throw new AvdManagerError(`An emulator named "${options.name}" already exists. Choose another name.`, 409);
+      throw new AvdManagerError("exists", `An emulator named "${options.name}" already exists. Choose another name.`);
     }
     await runTool(tools.avdmanager, [
       "create", "avd", "--name", options.name,

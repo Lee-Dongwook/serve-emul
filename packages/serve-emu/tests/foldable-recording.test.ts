@@ -4,7 +4,7 @@ import { createSessionReplayHandlers } from "../src/session-replay-session.ts";
 import { parseSessionSnapshot } from "../src/shared/api-contracts.ts";
 
 describe("foldable session replay", () => {
-  test("postures survive export, parsing and both replay APIs", async () => {
+  test("postures survive export, parsing and replay", async () => {
     const recorder = new SessionRecorder({ now: () => 0, sleep: async () => {} });
     recorder.recordPosture("half-open", "test");
     const snapshot = recorder.snapshot();
@@ -13,16 +13,14 @@ describe("foldable session replay", () => {
     expect(recorder.export().events[0]!.source).toBe("test");
     const calls: string[] = [];
     const handlers = { dispatchGesture: () => {}, setLocation: () => {}, setPosture: (posture: string) => { calls.push(posture); } };
-    await recorder.replay(handlers);
     const run = recorder.startReplay(handlers);
     expect((await run.completion).replayStatus).toBe("completed");
-    expect(calls).toEqual(["half-open", "half-open"]);
+    expect(calls).toEqual(["half-open"]);
   });
   test("fails before replay if a consumer cannot apply postures", async () => {
     const recorder = new SessionRecorder(); recorder.recordPosture("folded", "test");
     const handlers = { dispatchGesture: () => {}, setLocation: () => {} };
     expect(() => recorder.startReplay(handlers)).toThrow("posture replay is not supported");
-    await expect(recorder.replay(handlers)).rejects.toThrow("posture replay is not supported");
     expect(recorder.isReplaying).toBe(false);
   });
   test("posture replay obeys session generation and cancellation", async () => {

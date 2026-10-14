@@ -1,6 +1,7 @@
 import { FoldablePanel } from "./foldable-panel";
 import { memo, type ComponentType } from "react";
-import { AccessibilityPanel, type AccessibilityNode } from "./accessibility-panel";
+import type { AccessibilityNode } from "../../shared/api-contracts";
+import { AccessibilityPanel } from "./accessibility-panel";
 import { AppManagementPanel } from "./app-management-panel";
 import { FontScalePanel, NetworkPanel, NightModePanel, OrientationPanel } from "./device-panel";
 import { LocationPanel } from "./location-panel";

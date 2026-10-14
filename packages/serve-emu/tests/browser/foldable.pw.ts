@@ -32,14 +32,14 @@ test("non-foldable devices show setup guidance and disabled controls", async ({ 
 
 test("native command errors remain visible after a state refresh", async ({ page }) => {
   await page.route("**/api/foldable", (route) => route.fulfill(route.request().method() === "POST"
-    ? { status: 400, json: { ok: false, error: "KO: Failed to set posture" } }
+    ? { status: 502, json: { ok: false, error: { code: "downstream_failure", message: "adb emu fold failed", reason: "emulator-failed" } } }
     : { json: { ok: true, foldable: { supported: true, posture: "unfolded" } } }));
   await page.goto("/");
   await page.getByRole("button", { name: "Foldable", exact: true }).click();
   const panel = page.getByRole("region", { name: "Foldable controls" });
   await panel.getByRole("button", { name: "Fold", exact: true }).click();
-  await expect(panel.getByRole("alert")).toContainText("Failed to set posture");
+  await expect(panel.getByRole("alert")).toContainText("adb emu fold failed");
   await panel.getByRole("button", { name: "Refresh posture", exact: true }).click();
   await expect(panel.getByRole("status")).toHaveText("Unfolded");
-  await expect(panel.getByRole("alert")).toContainText("Failed to set posture");
+  await expect(panel.getByRole("alert")).toContainText("adb emu fold failed");
 });

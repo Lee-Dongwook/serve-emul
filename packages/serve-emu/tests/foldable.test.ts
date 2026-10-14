@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { getFoldableState, parseFoldPosture, setFoldPosture } from "../src/foldable.ts";
+import { FoldableError, getFoldableState, parseFoldPosture, setFoldPosture } from "../src/foldable.ts";
+import { CommandFailureError } from "../src/command-failure.ts";
 import type { execText } from "../src/exec.ts";
 
 function fixture({ supported = true, reject = false, settle = true } = {}) {
@@ -29,15 +30,15 @@ describe("native foldable control", () => {
   });
   test("physical devices and non-foldable emulators cannot be mutated", async () => {
     const { deps, calls } = fixture({ supported: false });
-    expect((await getFoldableState("usb-device", undefined, deps)).supported).toBe(false);
+    expect((await getFoldableState("usb-device", deps)).supported).toBe(false);
     expect(calls).toHaveLength(0);
-    await expect(setFoldPosture("emulator-5554", "folded", undefined, deps)).rejects.toThrow("no hinge sensor");
+    await expect(setFoldPosture("emulator-5554", "folded", deps)).rejects.toThrow("no hinge sensor");
     expect(calls).toHaveLength(1);
   });
   test("folds, half-opens and unfolds through the native console with serial targeting", async () => {
     const { deps, calls } = fixture();
     for (const posture of ["folded", "half-open", "unfolded"] as const) {
-      expect(await setFoldPosture("emulator-5558", posture, undefined, deps)).toEqual({ supported: true, posture });
+      expect(await setFoldPosture("emulator-5558", posture, deps)).toEqual({ supported: true, posture });
     }
     expect(calls.filter((args) => args[2] === "emu" && args[3] !== "sensor")).toEqual([
       ["-s", "emulator-5558", "emu", "fold"],
@@ -46,17 +47,19 @@ describe("native foldable control", () => {
     ]);
   });
   test("rejects console KO even with exit code zero and releases mutation lock", async () => {
-    await expect(setFoldPosture("emulator-5558", "folded", undefined, fixture({ reject: true }).deps)).rejects.toThrow("KO:");
-    expect((await setFoldPosture("emulator-5558", "folded", undefined, fixture().deps)).posture).toBe("folded");
+    const rejected = setFoldPosture("emulator-5558", "folded", fixture({ reject: true }).deps);
+    await expect(rejected).rejects.toBeInstanceOf(CommandFailureError);
+    await expect(rejected).rejects.toMatchObject({ code: "emulator-failed", publicMessage: "adb emu fold failed" });
+    expect((await setFoldPosture("emulator-5558", "folded", fixture().deps)).posture).toBe("folded");
   });
   test("does not claim success if Android never changes posture", async () => {
-    await expect(setFoldPosture("emulator-5558", "folded", undefined, fixture({ settle: false }).deps)).rejects.toThrow("did not confirm");
+    await expect(setFoldPosture("emulator-5558", "folded", fixture({ settle: false }).deps)).rejects.toMatchObject({ code: "unconfirmed" });
   });
   test("aborts device work and rejects overlapping changes", async () => {
     const abort = new AbortController(); abort.abort();
-    await expect(setFoldPosture("emulator-5558", "folded", abort.signal, fixture().deps)).rejects.toThrow("aborted");
-    const first = setFoldPosture("emulator-5558", "folded", undefined, fixture().deps);
-    await expect(setFoldPosture("emulator-5558", "unfolded", undefined, fixture().deps)).rejects.toThrow("already in progress");
+    await expect(setFoldPosture("emulator-5558", "folded", { ...fixture().deps, signal: abort.signal })).rejects.toThrow("aborted");
+    const first = setFoldPosture("emulator-5558", "folded", fixture().deps);
+    await expect(setFoldPosture("emulator-5558", "unfolded", fixture().deps)).rejects.toBeInstanceOf(FoldableError);
     await first;
   });
 });
