@@ -1,0 +1,123 @@
+import { useCallback, useEffect, useState } from "react";
+import type {
+  AccessibilityNode,
+  AccessibilitySelector,
+} from "../../shared/api-contracts";
+import { apiErrorMessage, apiRequest } from "../lib/api-client";
+import { useDeviceSessionSnapshot } from "../lib/device-session-store";
+import { usePoll } from "../lib/use-poll";
+import { AccessibilityNodeList } from "./accessibility-node-list";
+
+type Props = {
+  enabled: boolean;
+  nodes: AccessibilityNode[];
+  highlightedId: string | null;
+  onEnabledChange: (enabled: boolean) => void;
+  onNodesChange: (nodes: AccessibilityNode[]) => void;
+  onHighlight: (id: string | null) => void;
+};
+
+function preferredSelectorForNode(node: AccessibilityNode): AccessibilitySelector {
+  if (node.resourceId) return { resourceId: node.resourceId };
+  if (node.contentDescription) return { contentDescription: node.contentDescription };
+  if (node.text) return { text: node.text };
+  if (node.className || node.packageName) {
+    return {
+      className: node.className || undefined,
+      packageName: node.packageName || undefined,
+      clickable: node.clickable,
+      enabled: node.enabled,
+    };
+  }
+  return { id: node.id };
+}
+
+function nodesMatchingSelector(
+  nodes: AccessibilityNode[],
+  selector: AccessibilitySelector,
+): AccessibilityNode[] {
+  return nodes.filter((candidate) =>
+    Object.entries(selector).every(([key, value]) => {
+      if (key === "index" || value === undefined) return true;
+      return candidate[key as keyof AccessibilityNode] === value;
+    })
+  );
+}
+
+function selectorForNode(node: AccessibilityNode, nodes: AccessibilityNode[]): AccessibilitySelector {
+  const selector = preferredSelectorForNode(node);
+  const matches = nodesMatchingSelector(nodes, selector);
+  if (matches.length > 1) selector.index = matches.indexOf(node);
+  return selector;
+}
+
+export function AccessibilityPanel({
+  enabled,
+  nodes,
+  highlightedId,
+  onEnabledChange,
+  onNodesChange,
+  onHighlight,
+}: Props) {
+  const [status, setStatus] = useState("AX off");
+  const deviceSession = useDeviceSessionSnapshot();
+
+  const { refresh } = usePoll({
+    enabled: enabled && !deviceSession.transitioning,
+    poll: ({ signal }) => {
+      setStatus("Reading...");
+      return apiRequest("/api/accessibility", { method: "GET", cache: "no-store", signal });
+    },
+    onResult: (snapshot) => {
+      onNodesChange(snapshot.nodes);
+      setStatus(`${snapshot.nodes.length} nodes`);
+    },
+    onError: (error) => setStatus(apiErrorMessage(error)),
+    intervalMs: 3000,
+    pollKey: deviceSession.revision,
+  });
+
+  useEffect(() => {
+    if (enabled && !deviceSession.transitioning) return;
+    onNodesChange([]);
+    onHighlight(null);
+    setStatus(enabled ? "Switching device..." : "AX off");
+  }, [deviceSession.transitioning, enabled, onHighlight, onNodesChange]);
+
+  const tapNode = useCallback(async (node: AccessibilityNode) => {
+    setStatus("Tapping...");
+    try {
+      await apiRequest("/api/accessibility/tap", {
+        method: "POST",
+        body: { selector: selectorForNode(node, nodes) },
+      });
+      setStatus("Tapped");
+      refresh();
+    } catch (err) {
+      setStatus(apiErrorMessage(err));
+    }
+  }, [nodes, refresh]);
+
+  return (
+    <section className="tool-panel accessibility-panel">
+      <div className="panel-heading">
+        <h2>Accessibility</h2>
+        <div className="location-status">{status}</div>
+      </div>
+      <div className="panel-actions ax-actions">
+        <button onClick={() => onEnabledChange(!enabled)}>{enabled ? "Hide" : "Show"}</button>
+        <button onClick={() => void refresh()} disabled={!enabled}>
+          Refresh
+        </button>
+      </div>
+      {enabled ? (
+        <AccessibilityNodeList
+          nodes={nodes}
+          highlightedId={highlightedId}
+          onHighlight={onHighlight}
+          onTapNode={tapNode}
+        />
+      ) : null}
+    </section>
+  );
+}

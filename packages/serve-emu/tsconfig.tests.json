@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "types": [
+      "bun"
+    ],
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "tests/**/*.ts",
+    "tests/**/*.tsx",
+    "scripts/**/*.ts",
+    "vite.config.ts",
+    "playwright.config.ts"
+  ]
+}

@@ -1,0 +1,107 @@
+import {
+  adbCommandFailure,
+  adbSucceeded,
+  runAdb,
+  throwIfAdbAborted,
+  type AdbDeps,
+} from "./adb-command.ts";
+import { CommandFailureError } from "./command-failure.ts";
+
+export type { GeoFix } from "./shared/api-contracts.ts";
+import type { GeoFix } from "./shared/api-contracts.ts";
+
+function finiteNumber(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${name} must be a finite number`);
+  }
+  return value;
+}
+
+function optionalNumber(value: unknown, name: string): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  return finiteNumber(value, name);
+}
+
+function optionalInteger(value: unknown, name: string): number | undefined {
+  const n = optionalNumber(value, name);
+  if (n === undefined) return undefined;
+  if (!Number.isInteger(n)) throw new Error(`${name} must be an integer`);
+  return n;
+}
+
+function decimal(value: number): string {
+  return String(Number(value.toFixed(7)));
+}
+
+function geoFixArgs(serial: string, fix: GeoFix): string[] {
+  if (!/^emulator-\d+$/.test(serial)) {
+    throw new Error("location control is currently supported for Android Emulator serials only");
+  }
+
+  const args = [
+    "emu",
+    "geo",
+    "fix",
+    decimal(fix.longitude),
+    decimal(fix.latitude),
+  ];
+  if (fix.altitude !== undefined) args.push(decimal(fix.altitude));
+  if (fix.satellites !== undefined) args.push(String(fix.satellites));
+  if (fix.velocity !== undefined) args.push(decimal(fix.velocity));
+  return args;
+}
+
+function assertGeoFixOutput(status: number | null, output: string): void {
+  if (status !== 0 || /^KO\b/.test(output)) {
+    throw new CommandFailureError(
+      "adb-failed",
+      "adb emu geo fix failed",
+      output || "unknown error",
+    );
+  }
+}
+
+export function parseGeoFix(value: unknown): GeoFix {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("location payload must be an object");
+  }
+  const record = value as Record<string, unknown>;
+  const latitude = finiteNumber(record.latitude, "latitude");
+  const longitude = finiteNumber(record.longitude, "longitude");
+  const altitude = optionalNumber(record.altitude, "altitude");
+  const satellites = optionalInteger(record.satellites, "satellites");
+  const velocity = optionalNumber(record.velocity, "velocity");
+
+  if (latitude < -90 || latitude > 90) throw new Error("latitude must be between -90 and 90");
+  if (longitude < -180 || longitude > 180) throw new Error("longitude must be between -180 and 180");
+  if (altitude !== undefined && (altitude < -1000 || altitude > 100000)) {
+    throw new Error("altitude must be between -1000 and 100000");
+  }
+  if (satellites !== undefined && (satellites < 1 || satellites > 64)) {
+    throw new Error("satellites must be between 1 and 64");
+  }
+  if (velocity !== undefined && (velocity < 0 || velocity > 1000)) {
+    throw new Error("velocity must be between 0 and 1000");
+  }
+
+  return { latitude, longitude, altitude, satellites, velocity };
+}
+
+export async function setEmulatorLocationAsync(
+  serial: string,
+  fix: GeoFix,
+  deps: AdbDeps = {},
+): Promise<void> {
+  throwIfAdbAborted(deps.signal, "location update aborted");
+  const result = await runAdb(serial, geoFixArgs(serial, fix), {
+    timeout: 5_000,
+    maxBuffer: 64 * 1024,
+    lane: "interactive",
+    signal: deps.signal,
+    execText: deps.execText,
+  });
+  throwIfAdbAborted(deps.signal, "location update aborted");
+  if (!adbSucceeded(result)) throw adbCommandFailure("adb emu geo fix", result);
+  // The emulator console answers `KO: …` on a successful adb exit.
+  assertGeoFixOutput(result.status, `${result.stdout}${result.stderr}`.trim());
+}

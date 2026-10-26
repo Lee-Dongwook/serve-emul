@@ -1,0 +1,746 @@
+<!-- Generated from ../../README.md by scripts/sync-readme.ts. Do not edit directly. -->
+
+# serve-emu
+
+Host your Android emulator or attached Android device for agent workflows like Codex, Cursor, Claude Desktop, and browser-based QA. `serve-emu` streams the screen locally, over your LAN, or through your tunnel of choice, then accepts low-latency input and device-control commands over HTTP and WebSocket.
+
+
+
+https://github.com/user-attachments/assets/5646d44c-7fd1-4e97-8705-b44b47c7fdc6
+
+
+
+```sh
+bunx serve-emu@latest
+# or: npx serve-emu@latest
+# -> Preview at http://localhost:3300
+```
+
+Use `@latest` for one-off runs so Bun/npm fetches the newest published version instead of reusing a cached or locally installed copy.
+
+`serve-emu` starts the vendored scrcpy server on the device, opens an adb forward tunnel, forwards H.264 frames over WebSockets, and decodes them in the browser with WebCodecs. Input events are written directly to scrcpy's control socket instead of shelling out to `adb shell input`, keeping taps, swipes, text, and key events responsive enough for agents.
+
+## Status
+
+Current package version: see [`package.json`](package.json) and [`CHANGELOG.md`](CHANGELOG.md).
+
+Working:
+
+- Live H.264 video stream from device to WebCodecs canvas
+- Tap, swipe, text, keyevent, Back, Home, Recents, and Power input
+- Keyboard passthrough in the browser UI: editing/navigation keys, Ctrl/Cmd shortcuts (select all, copy, paste, cut, undo, redo), and IME composition for CJK text
+- Multi-client streaming, so multiple browser tabs can share one device
+- SPS/PPS replay and metadata headers for clients joining mid-stream
+- Device discovery, current-device switching, and AVD start/stop controls
+- Screenshot, foreground app, accessibility tree, and logcat APIs for agent inspection
+- Orientation, dark/light mode, font scale, and network on/off controls
+- Emulator GPS location control and route playback from GPX, GeoJSON, KML, or waypoint JSON
+- Session recording and replay for REST, WebSocket, and location events
+- APK install, app launch, clear data, force stop, permission grant, and media/file import helpers
+
+Experimental:
+
+- Host webcam or still image as the emulator's Android camera (`--camera-back`, `--camera-front`). The preview can be slow; see [Camera](#camera)
+
+Planned:
+
+- Multi-device routing
+- Embeddable Connect-style middleware (`serve-emu/middleware`)
+- Compiled single binary
+
+## Requirements
+
+- Bun 1.3.13+
+- `adb` on PATH from Android platform-tools
+- A booted device/emulator from `adb devices`, or an AVD name passed with `--avd`
+- Chrome, Edge, or Safari 16.4+ for the bundled WebCodecs UI
+
+`npx serve-emu@latest` also works, but the CLI itself runs on Bun, so Bun must be installed either way.
+
+## Package API
+
+As of 0.0.5, `serve-emu` is intentionally a CLI-only package. The only
+supported package surface is the installed `serve-emu` executable. There are
+no supported JavaScript or TypeScript import paths: both `import "serve-emu"`
+and deep imports such as `import "serve-emu/src/adb.ts"` are blocked by the
+package export map. Files shipped for the CLI are implementation details and
+carry no import-path stability guarantee.
+
+The documented HTTP and WebSocket endpoints remain supported runtime APIs once
+the CLI is running; they are not package imports. The planned
+`serve-emu/middleware` entry point is not available yet and must not be
+imported until it is explicitly exported and documented in a future release.
+
+## Quick Start
+
+One-off run from npm:
+
+```sh
+bunx serve-emu@latest
+# or
+npx serve-emu@latest
+```
+
+Local development from this repository:
+
+```sh
+bun install
+bun run --filter serve-emu setup
+bun run packages/serve-emu/src/cli.ts
+# -> http://localhost:3300
+```
+
+`setup` downloads the pinned `scrcpy-server-v4.0` into `vendor/`, checks it against the SHA-256 from upstream's `SHA256SUMS.txt`, and builds the browser UI. The CLI also runs the scrcpy setup lazily on first start, so you can skip the setup step for a quick local run. A server file whose SHA-256 does not match is downloaded again and is never pushed to a device. The npm package ships the verified server.
+
+## CLI
+
+```text
+serve-emu [-p <port>] [--host <addr>] [--token <secret>] [-s <serial>] [--max-fps N] [--bit-rate N] [--max-size N] [--key-frame-interval sec] [--repeat-frame-ms ms] [--max-apk-upload-bytes N] [--max-media-upload-bytes N]
+serve-emu --avd <name> [--gpu <mode>] [--restart-avd] [--camera-back <mode>] [--camera-front <mode>]
+serve-emu --avd-list
+serve-emu --running-avds
+serve-emu --webcam-list
+```
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `-p, --port` | `3300` | HTTP port for the preview server |
+| `--host` | `127.0.0.1` | Address to bind. Defaults to loopback so the device is not exposed. Set `0.0.0.0` to serve over the LAN — see [Access control](#access-control) |
+| `--token` | none | Shared secret required on every request. Auto-generated for non-loopback binds if omitted. Letters, digits, `.`, `_`, `~`, and `-` only |
+| `--unsafe-no-auth` | false | Allow a non-loopback bind with **no** authentication (dangerous) |
+| `--allowed-host` | none | Without `--token`, also serve requests for this host name (repeatable; no wildcards), e.g. behind a reverse proxy. IP addresses, `localhost`, and `--host` are always served |
+| `-s, --serial` | auto | adb device serial; required when multiple devices are online |
+| `--max-fps` | `60` | Cap source frame rate |
+| `--bit-rate` | `8000000` | H.264 bit rate in bps |
+| `--max-size` | `1280` | Downscale the longest edge to N pixels; `0` keeps native size. The emulator's software H.264 encoder sustains 60fps only below ~1 megapixel, hence the 1280 default |
+| `--key-frame-interval` | `10` | Advisory keyframe interval; `0` omits this codec option, which leaves scrcpy's own 10 s default. The emulator's encoder counts it in frames at a nominal 60fps, so keyframes arrive later at lower frame rates. Clients get keyframes on demand via `reset-video` and never wait for a periodic one |
+| `--repeat-frame-ms` | `0` | Re-encode the previous frame after N ms without screen changes; `0` keeps the encoder default of 100ms. Android repeats a frame at most 10 times, so a static screen still stops sending frames |
+| `--max-apk-upload-bytes` | `536870912` | Maximum APK file bytes accepted by the streaming multipart endpoint |
+| `--max-media-upload-bytes` | `1073741824` | Maximum media/file bytes accepted by the streaming multipart endpoint |
+| `--max-active-uploads` | `2` | Maximum upload operations reading, staging, or running through ADB concurrently |
+| `--max-queued-uploads` | `4` | Maximum uploads waiting for an active slot; further requests receive `429` |
+| `--upload-queue-timeout-ms` | `5000` | Maximum time an upload may wait for a slot before receiving `503` |
+| `--avd` | none | Launch this Android Virtual Device before streaming; if `serve-emu` started it, `serve-emu` exits when it exits while it is still the streamed device |
+| `--gpu` | `host` (`swiftshader_indirect` on Linux without a display) | Emulator GPU mode for emulators `serve-emu` launches (`--avd` and `/api/avds/start`). `host` renders on the real GPU for smooth ~60fps; see [Smooth Emulator Playback](#smooth-emulator-playback) |
+| `--restart-avd` | false | Stop a running matching AVD before launching it |
+| `--camera-back` | AVD setting | Experimental. Back camera for `--avd` launches, such as `webcam0` for a host webcam; see [Camera](#camera) |
+| `--camera-front` | AVD setting | Experimental. Front camera for `--avd` launches; same modes as `--camera-back` except `virtualscene` |
+| `--avd-list` | false | List available Android Virtual Device names |
+| `--running-avds` | false | List currently running emulator serials and AVD names |
+| `--webcam-list` | false | Experimental. List host webcams the emulator can use, as `webcam<N>` and device name |
+| `--emulator` | auto | Android Emulator binary path; defaults to PATH or Android SDK env vars |
+| `--emulator-port` | auto | Emulator console port for `--avd`; must be an even port from 5554 through 5682 |
+| `--emulator-window`, `--no-emulator-window` | auto | Show or hide the window of emulators `serve-emu` launches (`--avd` and `/api/avds/start`); see [Emulator Window](#emulator-window) |
+
+By default, `serve-emu` attaches to the only online device. If more than one device is online, pass `-s <serial>` or select another running device later through the HTTP API/UI.
+
+## Access control
+
+`serve-emu` grants full control of the connected device — input, screenshots, APK installation, file import, app-data clearing, logcat, and session controls. Treat access to the port as access to the device.
+
+**Default (loopback).** With no flags the server binds to `127.0.0.1`, so only processes on the same machine can reach it. No authentication is required, and local CLI/agent workflows keep working with no setup. Browser pages still cannot drive your device through the local port:
+
+- Cross-origin WebSocket upgrades and state-changing requests are rejected (the `Origin` must match the host).
+- Requests whose `Host` is a DNS name are rejected with `403`, so a page that rebinds its own domain to `127.0.0.1` (DNS rebinding) is turned away. IP addresses, `localhost`, `*.localhost`, the `--host` value, and any `--allowed-host` names are served. Behind a reverse proxy that keeps its public host name, either pass `--allowed-host <name>` or use `--token`.
+- Cross-site subresource requests (images, scripts, `fetch` from another site) are rejected using the browser's `Sec-Fetch-Site` header, and so are cross-site navigations or frames that point at `/api`, `/health`, or `/ws`. Opening the UI from a link or in an IDE's embedded browser still works, and clients that send no such header (CLI, agents) are unaffected.
+
+Only `localhost` and literal loopback addresses (`127.0.0.0/8`, `::1`, and IPv4-mapped `::ffff:127.x.x.x`) count as loopback. Any other host name is treated as non-loopback, even one that happens to resolve to `127.x`.
+
+**Exposing over the LAN or a tunnel.** Pass `--host 0.0.0.0` (or a specific interface address). A non-loopback bind **requires authentication**:
+
+- If you pass `--token <secret>`, that secret is required on every request. It may contain only letters, digits, `.`, `_`, `~`, and `-`, so it passes through the URL, the session cookie, and the `Authorization` header unchanged; serve-emu refuses to start with any other character.
+- If you omit `--token`, a random token is generated and printed once at startup.
+
+The startup line prints a ready-to-use URL with the token, for example:
+
+```text
+serve-emu → http://localhost:3300/?token=qNEvGN1TSgqRc3NHeZiXOfX2tkQUnv68  (device: emulator-5554)
+```
+
+How clients authenticate:
+
+- **Browser (bundled UI):** open the printed `?token=` URL once. The server exchanges the token for a `HttpOnly; SameSite=Strict` session cookie and redirects to a clean URL, so the secret is not kept in local storage or the address bar. Same-origin API, SSE, and WebSocket calls then carry the cookie automatically.
+- **Agents / CLI (`curl`, HTTP clients):** send `Authorization: Bearer <token>`, or append `?token=<token>` to the URL.
+
+Browsers decode the stream only in a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts): `localhost`, `127.0.0.1`, or HTTPS. Over plain HTTP on a LAN address or another host name, the controls and API work but the video shows `WebCodecs unsupported`; put a TLS-terminating proxy in front, or use an SSH tunnel to a local port.
+
+Requests without a valid token get `401`; WebSocket upgrades and state-changing requests from a mismatched `Origin`, and cross-site subresource requests, get `403` before any work is done. With a token, any host name is served: a rebound page has neither the secret nor the host-scoped cookie.
+
+**Unauthenticated LAN exposure.** `--host 0.0.0.0 --unsafe-no-auth` binds to all interfaces with no authentication. Anyone who can reach the port can control the device. Only use this on a trusted, isolated network; the CLI prints a warning at startup.
+
+**Token handling.** The token is never included in `/health`, `/api` responses, error payloads, or reconnect URLs — only in the one-time startup line. Rotate it by restarting with a new `--token` (or letting a fresh one be generated); existing cookies stop working immediately. When exposing beyond your machine, prefer an SSH tunnel or an authenticating reverse proxy over a raw `0.0.0.0` bind.
+
+## Emulator Window
+
+The browser is the display, so an emulator's own window is optional.
+`--no-emulator-window` launches emulators with `-no-window`, and
+`--emulator-window` asks for the window. Without either flag, the window
+opens wherever a display exists. On Linux without `DISPLAY` or
+`WAYLAND_DISPLAY` (SSH sessions without X forwarding, CI, servers),
+emulators launch headless, because the emulator aborts there when it tries
+to open a window. A forwarded or stale `DISPLAY` (`ssh -X`, an old tmux
+session) still counts as a display; pass `--no-emulator-window` there. The
+setting, like `--gpu` and `--emulator`, applies to `--avd` and to emulators
+started from the UI or `/api/avds/start`. Without a display the GPU default
+is `swiftshader_indirect` instead of `host`, because the host GPU renders
+through the display and the emulator cannot start without it; an explicit
+`--gpu` still wins. It has no effect on an AVD that is already running.
+
+```sh
+# no emulator window, even on a desktop
+serve-emu --avd Pixel_8 --no-emulator-window
+```
+
+## Smooth Emulator Playback
+
+The single biggest factor for stutter-free emulator streaming is the **emulator GPU mode**, not the bit rate or the transport. Many AVDs default to `auto`, which on some hosts (notably Apple Silicon) falls back to a **software Vulkan compositor** (`llvmpipe`/`lavapipe`). That caps the guest at a janky ~20fps with dropped frames, so the stream stutters no matter how high you set `--max-fps` or `--bit-rate`.
+
+`serve-emu` launches emulators (`--avd` and `/api/avds/start`) with **`-gpu host`** by default wherever a display exists, which renders on the real GPU (Metal/Vulkan) for smooth ~60fps playback (measured: guest jank dropped from 10–19% to 0%). On Linux without a display it uses `-gpu swiftshader_indirect`, since the host GPU cannot start its renderer there (see [Emulator Window](#emulator-window)). Override with `--gpu <mode>` when needed:
+
+```sh
+# default — real GPU, smooth
+serve-emu --avd Pixel_8
+
+# a desktop host without a usable GPU
+serve-emu --avd Pixel_8 --gpu swiftshader_indirect
+```
+
+If you start the emulator yourself (or attach to a pre-booted one with `-s`), `serve-emu` can't set its GPU mode — launch it with `-gpu host` directly:
+
+```sh
+emulator @Pixel_8 -gpu host
+```
+
+You can confirm the mode in the emulator log (`vulkan_mode_selected:host` = good; `lavapipe`/`llvmpipe` = software fallback) or via `adb shell dumpsys gfxinfo <pkg>` (look for a low "Janky frames" percentage while scrolling). For an extra fps margin, lower `--max-size` to stream at a smaller resolution.
+
+## Camera
+
+**Experimental.** Camera support is new in 0.1.0, and the camera preview can be slow. The camera flags may change in a later release. Please report problems in [GitHub issues](https://github.com/jiunshinn/serve-emu/issues).
+
+An emulator can use your computer's webcam as its Android camera. List the webcams the emulator can see, then pass one when `serve-emu` launches the AVD:
+
+```sh
+serve-emu --webcam-list
+# webcam0	FaceTime HD Camera
+
+serve-emu --avd Pixel_8 --camera-back webcam0
+```
+
+Open a camera app in the stream and its preview shows the webcam. Use `--camera-front` for apps that open the front camera. One webcam can feed only one of the two.
+
+The emulator picks its cameras at boot, so the camera flags require `--avd` and don't apply to devices attached with `-s`. If the AVD is already running, add `--restart-avd`; without it, `serve-emu` exits with an error instead of attaching to an emulator that lacks the camera. Changing an AVD's cameras invalidates its Quick Boot snapshot, so that launch cold-boots.
+
+The flags also accept the emulator's other camera modes, listed by `emulator -help-camera-back`: `emulated`, `virtualscene` (back only), `none`, and `imagefile:<path>` to show a still image, such as a QR code for a scanner test.
+
+On macOS, the first time an Android app opens the webcam, macOS asks whether the app that launched `serve-emu` (usually your terminal) may use the camera. If you denied it, turn it back on under **System Settings → Privacy & Security → Camera**. The emulator can't open a webcam that another app is using.
+
+Known limitations:
+
+- The preview updates no faster than the webcam, usually 30 fps, while the rest of the stream can reach 60 fps.
+- On Apple Silicon, Android Emulator 36.6 slows the preview to a few frames per second about 10 seconds after a camera app opens it, once the rest of the guest goes idle. The whole Android UI slows down too; the camera just makes it obvious. Emulator 37.2.12 holds about 30 fps, so update with `sdkmanager --install emulator`. If you can't update, lower the AVD to 2 CPU cores (`hw.cpu.ncore=2` in its `config.ini`).
+- The webcam is the one on the computer running `serve-emu`. A remote viewer's browser camera can't feed the emulator.
+- AVDs started from the browser UI's device panel keep their own camera settings.
+
+## Browser UI
+
+Open `http://localhost:3300` after starting the CLI. The UI streams the device into a canvas and exposes controls for:
+
+- Pointer input, keyboard passthrough (typing, navigation keys, shortcuts, IME composition), hardware buttons, and screenshots
+- Device selection plus AVD start/stop
+- Orientation, night mode, font scale, network, GPS location, and route playback
+- Logcat filtering, pause/copy controls, app management, file import, and session replay
+
+The browser decoder treats every WebSocket reconnect, device video session, and
+hard decoder recovery as a new stream generation. Codec, latency, frame counts,
+and rendered state are cleared at each boundary; the UI reports `streaming`
+only after a frame from the current generation reaches the canvas. A connected
+session with no frame becomes `waiting for video`, while fresh packets that do
+not produce frames become `stream stalled`. Late events from older generations
+are ignored. Input sent while the video WebSocket is disconnected is dropped
+instead of being replayed against a later device session.
+
+Each display refresh draws one decoded frame. While the player keeps up (at
+most two frames waiting, the older decoded less than 1.5 refresh intervals
+ago), it draws the older one and keeps the next for the following refresh,
+so two frames that finish decoding close together are both shown. A deeper
+queue or an older frame means the player fell behind, after a stall or a
+burst; it then jumps to the newest frame and drops the rest, so latency
+recovers at once. The status bar's tooltip counts the frames dropped this
+way as `skipped`.
+
+## HTTP API
+
+All examples assume the default port:
+
+```sh
+BASE=http://localhost:3300
+```
+
+Every failed `/api` request returns one JSON shape, with an HTTP status that
+matches its `code`:
+
+```json
+{ "ok": false, "error": { "code": "rate_limited", "message": "upload queue is full", "reason": "upload-queue-full" } }
+```
+
+`code` is one of `invalid_request` (`400`), `invalid_json` (`400`),
+`unauthorized` (`401`), `forbidden` (`403`), `not_found` (`404`),
+`method_not_allowed` (`405`), `conflict` (`409`, for example a device switch
+during the request), `payload_too_large` (`413`), `rate_limited` (`429`),
+`internal_error` (`500`), `downstream_failure` (`502`: an adb or emulator
+command failed), `service_unavailable` (`503`, including an adb command that
+could not reach the device), or `downstream_timeout` (`504`: an adb command
+timed out). The optional `reason` names a finer-grained cause within the code,
+such as `control-queue-overloaded`.
+
+A failed command names only the operation, such as `screencap failed`,
+`adb install timed out`, or `cmd uimode night failed: the device is
+unavailable`, and its output goes to the server log with the request's method
+and path. Its `reason` says why it failed:
+
+| `reason` | `code` | When |
+| --- | --- | --- |
+| `adb-device-unavailable` | `service_unavailable` | adb says the device is offline, unauthorized, not found, or its connection closed |
+| `adb-timeout` | `downstream_timeout` | the command ran past its deadline |
+| `adb-failed` | `downstream_failure` | the command failed on a reachable device |
+| `adb-aborted` | `downstream_failure` | the command was cancelled |
+| `adb-output-limit` | `downstream_failure` | the command printed more output than allowed |
+| `adb-cleanup-failed` | `downstream_failure` | a temporary file on the device could not be removed |
+| `emulator-failed` | `downstream_failure` | the emulator binary failed |
+An `internal_error` has a fixed message, such as `Internal server error`.
+
+### Health And Discovery
+
+```sh
+curl "$BASE/health"
+curl "$BASE/api"
+curl "$BASE/api/devices"
+curl "$BASE/api/device-grid"
+curl -X POST "$BASE/api/devices/select" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial":"emulator-5554"}'
+```
+
+`/health` includes bounded subprocess executor activity, queue depth, lane
+counts, deadlines, overload rejections, and output-limit totals. Device-grid
+refreshes reuse one `adb devices` snapshot while resolving running AVD names.
+Long install/import work uses a background lane; the default executor reserves
+one active slot and eight queue positions for interactive work such as GPS.
+
+`sourceState` says whether video is `streaming` (a frame in the last 2.5 s),
+`idle` (no recent frame, and no reset is waiting for one), `stalled` (a reset
+got no frame, or the first frame never came), or `starting`. While a stream
+client is connected, the server restarts the encoder after 2.5 s without
+frames to check that it is alive. Each check that the encoder answers with
+only its own key frame doubles that wait, up to 30 s
+(`keyFrameRecovery.stallResetAfterMs`). A sustained run of frames (more than
+16, each within 1 s of the last) brings it back to 2.5 s. Input does not:
+an action that changes nothing on screen sends no frame either, so taps and
+keys never trigger a check of their own. An encoder that stops answering is
+found by the next check and retried with growing gaps while `sourceState`
+reports `stalled`. With no stream client connected the server sends no
+checks, so a quiet source reports `idle` without having been checked.
+
+Every encoder restart is counted. `videoResetRequests` and
+`lastVideoResetReason` keep the total and the latest reason.
+`videoResetsByReason` breaks the total down by reason (`client opened`,
+`client requested keyframe`, `client awaiting keyframe`, `client
+backpressure`, `first video frame not received`, `video source stalled`,
+`video source idle`), and `videoResetsLastMinute` shows a reset storm as it
+happens.
+
+`contention.otherScrcpySessions` counts the other scrcpy sessions on the
+device: another `serve-emu`, or a desktop `scrcpy`. Each session encodes the
+screen again, so every stream slows down; two sessions on one emulator
+measured 17–21 fps each instead of 60. A streaming session reads the
+device's `/proc/net/unix` 2 s after it starts and every 10 s after that, with
+one bounded `adb shell` call. `/health` reports the last answer and never
+waits for a probe. `contention` is `null` until the first probe answers. The
+UI shows a warning in the status bar while the count is above zero.
+
+Create an emulator from **Add emulator** in the Devices panel. Choose a name,
+SDK hardware profile (including Fold-in, Flip-style and
+Pixel Fold profiles when installed), and a system image compatible with the
+host CPU. Creation does not start the device or change the active session;
+use **Start** in the Devices panel afterward. Foldable profiles run stock
+Android, not Samsung One UI.
+
+Creation requires Android SDK Command-line Tools and Java 17 or newer. Install
+the tools through Android Studio → SDK Manager → SDK Tools, and set
+`ANDROID_HOME` to the SDK directory. Set `JAVA_HOME` if Java is not on PATH;
+Android Studio's bundled JBR can be used. System images must already be installed
+through SDK Manager → SDK Platforms (Show Package Details). The dialog includes
+setup guidance and a reload action. Existing AVDs are never overwritten.
+
+AVD lifecycle helpers:
+
+```sh
+# Discover hardware profile IDs and installed, host-compatible image IDs.
+curl "$BASE/api/avds/catalog"
+
+# Use profile/image IDs returned by the catalog.
+curl -X POST "$BASE/api/avds/create" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"My_Fold","profile":"pixel_fold","image":"system-images;android-34;google_apis_playstore;arm64-v8a"}'
+```
+
+Creation returns HTTP 201 with `{ "ok": true, "avd": "My_Fold" }`.
+Names use 1–80 letters, numbers, underscores or hyphens and begin with a letter
+or number. Duplicate names and concurrent creation requests return HTTP 409;
+missing SDK tools return HTTP 503 and a failing SDK command returns HTTP 502,
+both with setup guidance.
+
+```sh
+curl -X POST "$BASE/api/avds/start" \
+  -H 'Content-Type: application/json' \
+  -d '{"avd":"Pixel_8","select":true}'
+
+curl -X POST "$BASE/api/avds/stop" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial":"emulator-5554"}'
+```
+
+An emulator that `/api/avds/start` launched belongs to the server, like a
+`--avd` emulator belongs to the CLI: it stops when the server stops, including
+while it is still booting. A client that gives up on a slow cold boot does not
+cancel it; the emulator keeps booting and can be selected later. An AVD that
+was already running is only attached to and is left alone. Stopping an emulator
+sends `emu kill` and SIGTERM, then SIGKILL after 10 seconds. An emulator that
+exits on its own is forgotten, so another AVD that later takes its port is not
+stopped with the server.
+
+The CLI's lifetime follows an `--avd` emulator it started. If that emulator
+exits on its own (window closed, `adb emu kill`, a crash) while it is still
+the streamed device, `serve-emu` logs the exit and stops with exit code 1,
+freeing its port. It keeps running if a client switched to another device
+first, or stopped that emulator through `/api/avds/stop`. An `--avd` that
+was already running is only attached to, so its exit does not stop
+`serve-emu`. When the port is already
+taken by another `serve-emu`, startup names that server's device and status.
+
+### Foldable Testing
+
+Select a running Pixel Fold or Fold-in AVD, then open **Foldable** in the tools
+sidebar. **Fold**, **Half-open**, and **Unfold** use the emulator’s native
+hinge/posture controls, so Android receives actual device-state changes. The
+panel reads Android’s committed posture; non-foldable and physical devices show
+setup guidance. Video and touch coordinates follow the active display size.
+Half-open selects a hinge posture; the app decides whether to show a tabletop
+or two-pane layout.
+
+The browser mirrors a flat image of the active display, not a 3D bent device.
+Half-open keeps the entire inner screen active and may look unchanged on an
+app's home screen. For tabletop testing, use **Orientation** to turn the hinge
+horizontally and open an app screen that responds to that posture.
+
+```sh
+curl "$BASE/api/foldable"
+curl -X POST "$BASE/api/foldable" \
+  -H 'Content-Type: application/json' \
+  -d '{"posture":"folded"}'
+# Other postures: "half-open", "unfolded".
+```
+
+Posture actions are recorded by default and replay alongside gestures and
+location changes. Pass `"record": false` to omit an action. Use the **Session**
+tool to replay a fold/unfold sequence while checking app state preservation.
+These controls require an Android emulator with a hinge sensor; Samsung One UI
+is not emulated. See [Android’s native posture commands](https://developer.android.com/blog/posts/emulator-control-for-adaptive-app-development).
+
+### Input
+
+Coordinates are normalized from `0` to `1` and converted to screen pixels by the server.
+
+```sh
+curl -X POST "$BASE/api/tap" \
+  -H 'Content-Type: application/json' \
+  -d '{"x":0.5,"y":0.5}'
+
+curl -X POST "$BASE/api/swipe" \
+  -H 'Content-Type: application/json' \
+  -d '{"x1":0.5,"y1":0.8,"x2":0.5,"y2":0.2,"durationMs":350}'
+
+curl -X POST "$BASE/api/text" \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"hello"}'
+
+curl -X POST "$BASE/api/key" \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"back"}'
+```
+
+Arbitrary keycodes accept an optional `action` (`"down"` or `"up"`; omit for an immediate press) and an optional `metaState` bitmask using Android's `AMETA_*` values (`0x1` shift, `0x2` alt, `0x1000` ctrl):
+
+```sh
+# Ctrl+A (select all)
+curl -X POST "$BASE/api/key" \
+  -H 'Content-Type: application/json' \
+  -d '{"keycode":29,"metaState":4096}'
+
+# Hold DPAD_DOWN down, then release it later
+curl -X POST "$BASE/api/key" -H 'Content-Type: application/json' -d '{"keycode":20,"action":"down"}'
+curl -X POST "$BASE/api/key" -H 'Content-Type: application/json' -d '{"keycode":20,"action":"up"}'
+```
+
+### Inspection
+
+```sh
+curl "$BASE/api/screenshot" --output screen.png
+curl "$BASE/api/screenshot?format=base64"
+curl "$BASE/api/foreground"
+curl "$BASE/api/accessibility"
+curl -X POST "$BASE/api/accessibility/tap" \
+  -H 'Content-Type: application/json' \
+  -d '{"selector":{"resourceId":"com.example:id/login"}}'
+curl -X POST "$BASE/api/accessibility/tap" \
+  -H 'Content-Type: application/json' \
+  -d '{"selector":{"textContains":"Continue","clickable":true}}'
+curl -N "$BASE/api/logcat?package=com.example.app&search=error"
+```
+
+Logcat subscriptions share one `adb logcat` child for the active device.
+New children start at the live tail instead of replaying the device's buffered
+history. Matching lines are delivered in short `logs` SSE batches; each
+subscriber has bounded line and byte queues, and batch payloads report
+queue/source drop counts. `/health` exposes the active child, subscriber count,
+queued bytes, limits, and cumulative delivery/drop totals under `logcat`.
+Pausing Logcat in the browser closes its SSE connection, so paused panels do
+not keep receiving and discarding device output.
+
+### Device Settings
+
+```sh
+curl "$BASE/api/orientation"
+curl -X POST "$BASE/api/orientation" \
+  -H 'Content-Type: application/json' \
+  -d '{"orientation":"landscape"}'
+
+curl "$BASE/api/night-mode"
+curl -X POST "$BASE/api/night-mode" \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"dark"}'
+
+curl "$BASE/api/font-scale"
+curl -X POST "$BASE/api/font-scale" \
+  -H 'Content-Type: application/json' \
+  -d '{"scale":1.2}'
+
+curl "$BASE/api/network"
+curl -X POST "$BASE/api/network" \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":false}'
+```
+
+### Location And Routes
+
+Location control uses the Android Emulator `geo fix` command and is currently emulator-only.
+
+```sh
+curl "$BASE/api/location"
+curl -X POST "$BASE/api/location" \
+  -H 'Content-Type: application/json' \
+  -d '{"latitude":37.5665,"longitude":126.978}'
+```
+
+Start route playback from waypoints:
+
+```sh
+curl -X POST "$BASE/api/route" \
+  -H 'Content-Type: application/json' \
+  -d '{"speedKph":30,"multiplier":1,"loop":false,"waypoints":[{"latitude":37.5665,"longitude":126.978},{"latitude":37.5651,"longitude":126.98955}]}'
+```
+
+Read, pause, resume, or stop playback:
+
+```sh
+curl "$BASE/api/route"
+curl -X POST "$BASE/api/route/control" \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"pause"}'
+curl -X DELETE "$BASE/api/route"
+```
+
+The browser route importer accepts GPX, KML, GeoJSON, and waypoint JSON files
+up to 2 MiB. It rejects oversized files before reading them, parses in a
+cancellable Web Worker, and enforces the 10,000-waypoint, nesting, and
+complexity limits during traversal. Playback receives the complete validated
+waypoint sequence. Map display is separate: it caches projection by route and
+zoom, simplifies the line to at most 1,024 screen-space points, and pans it with
+one CSS transform per animation frame. The interaction target is one 16.7 ms
+frame at 60 Hz. Follow route is explicit; manually panning turns it off so the
+one-second status poll does not force the map center back onto the route.
+
+### Sessions
+
+REST and WebSocket input events are recorded by default. Add `"record":false`
+to a tap, swipe, text, key, or `/api/location` payload when an event should not
+be saved. A WebSocket touch pointer is recorded or not as a whole, decided by
+its `down`: its moves, its `up`, and a disconnect release follow that choice, so
+the record flag never splits a gesture. Replay likewise skips a move or `up`
+whose `down` was not replayed (for example after a clear or an eviction) and
+lifts any pointer still pressed when it completes or is cancelled. History uses a
+2,000-event, 1 MiB circular retention budget; `/health` contains only its
+compact count/byte/replay summary. Text is normalized to scrcpy's 300-byte
+UTF-8 control limit before both dispatch and recording.
+
+```sh
+curl "$BASE/api/session?limit=6"
+curl "$BASE/api/session?limit=50&before=1200"
+curl "$BASE/api/session/export"
+curl -X POST "$BASE/api/session/replay" \
+  -H 'Content-Type: application/json' \
+  -d '{"multiplier":2}'
+curl -X POST "$BASE/api/session/replay/stop"
+curl -X DELETE "$BASE/api/session"
+```
+
+Session pages are returned in chronological order with an exclusive
+`nextBefore` cursor and `hasMore` flag. The bounded full history is serialized
+only by the explicit export endpoint (and by the UI's Copy action), rather than
+on every poll. The UI requests only its six visible recent events and pauses
+polling while the Session panel or browser tab is hidden. `/health` exposes the
+last/max UTF-8 response bytes and JSON serialization time for health, session
+page, and export responses under `responseMetrics`. The health entry describes
+the previous completed `/health` response because the current body is measured
+after it is serialized.
+
+### Apps And Files
+
+```sh
+curl -X POST "$BASE/api/apps/install" \
+  -F apk=@/path/to/app.apk
+
+curl -X POST "$BASE/api/apps/launch" \
+  -H 'Content-Type: application/json' \
+  -d '{"packageName":"com.example.app","activity":".MainActivity"}'
+
+curl -X POST "$BASE/api/apps/clear" \
+  -H 'Content-Type: application/json' \
+  -d '{"packageName":"com.example.app"}'
+
+curl -X POST "$BASE/api/apps/force-stop" \
+  -H 'Content-Type: application/json' \
+  -d '{"packageName":"com.example.app"}'
+
+curl -X POST "$BASE/api/apps/grant" \
+  -H 'Content-Type: application/json' \
+  -d '{"packageName":"com.example.app","permission":"android.permission.POST_NOTIFICATIONS"}'
+
+curl -X POST "$BASE/api/files/import" \
+  -F file=@/path/to/image.png
+```
+
+Uploads stream to private asynchronous temporary files and are removed after
+ADB completes. Actual bytes are enforced even without `Content-Length`; a
+device switch or server shutdown cancels work against the captured old device.
+Oversized requests receive `413`, and upload capacity errors are structured
+JSON responses. `/health` includes current upload queue metrics.
+
+## WebSocket API
+
+Connect to `/ws` for the raw Annex-B H.264 stream. Send JSON control messages over the same socket:
+
+```json
+{"type":"tap","x":0.5,"y":0.5}
+{"type":"swipe","x1":0.5,"y1":0.8,"x2":0.5,"y2":0.2,"durationMs":350}
+{"type":"text","text":"hello"}
+{"type":"key","keycode":66}
+{"type":"key","keycode":29,"metaState":4096}
+{"type":"key","keycode":20,"action":"down"}
+{"type":"back"}
+{"type":"reset-video"}
+```
+
+Use `/ws?frame-meta=1` to receive a 24-byte `SEMU` v2 frame metadata header before each H.264 access unit: magic `SEMU` (4B), version=2 (1B), flags (1B, bit 0 = keyframe), reserved (2B), PTS (8B BE, µs), and the server send time (8B BE, epoch µs). Same-host clients can compare the send time against their own clock to measure transit and glass-to-glass latency. The bundled UI uses this mode to avoid per-frame NAL scans and to track PTS/keyframe/latency state.
+
+See the [protocol reference](docs/protocol.md) for the complete scrcpy v3/v4 framing, control packet, and `SEMU` v1/v2 wire formats.
+
+## How It Works
+
+```text
++------------------+ adb forward  +-------------+  H.264 / WS   +---------+
+| scrcpy-server.jar| <----------> | serve-emu   | ------------> | Browser |
+| on device        | TCP tunnel   |   (Bun)     |  WebCodecs    | <canvas>|
+|  - video socket  |              |             | <------------ |         |
+|  - control socket|              |             |  input JSON   |         |
++------------------+              +-------------+               +---------+
+```
+
+1. The CLI pushes the verified `scrcpy-server-v4.0` once to a content-addressed cache, `/data/local/tmp/serve-emu-scrcpy-server-v4.0.jar-<SHA-256 prefix>`, and copies it to a per-session working path.
+2. It opens `adb forward tcp:<localPort> localabstract:scrcpy_<scid>`.
+3. It spawns `app_process` with the scrcpy server class on the device, then connects video and control sockets through the tunnel.
+4. The Bun server reads scrcpy's framed H.264 stream and forwards each access unit as a binary WebSocket message. Raw `/ws` clients receive Annex-B payloads unchanged; the built-in browser UI opts into the 24-byte frame metadata header.
+5. The browser configures a `VideoDecoder` from SPS/PPS data and draws decoded frames to a `<canvas>`. Pointer events are normalized to unit coordinates and encoded as scrcpy control socket packets.
+
+## Development
+
+`bun run check` enforces executed-line coverage floors, type checks, build, and package validation. Browser streaming tests separately exercise the built UI and production WebSocket handlers in Chromium, including real H.264 decoding, refresh, multi-tab device switching, input failure delivery, and slow-decoder recovery. See [the browser test guide](https://github.com/jiunshinn/serve-emu/blob/main/packages/serve-emu/tests/browser/README.md).
+
+```sh
+bun install
+bun run --filter serve-emu setup
+bun run --filter serve-emu dev
+bun run --filter serve-emu typecheck
+bun run --filter serve-emu typecheck:ui
+bun run --filter serve-emu build
+bun run check
+(cd packages/serve-emu && bunx playwright install chromium)
+bun run --filter serve-emu test:browser
+```
+
+`dev:ui` proxies `/api`, `/health`, and `/ws` to
+`http://localhost:3300` by default. To run the backend on another port while
+keeping the Vite UI on its normal development origin, start the two processes
+like this:
+
+```sh
+# terminal 1: backend on a non-default port
+bun run packages/serve-emu/src/cli.ts --port 4319
+
+# terminal 2: UI with API, health, and WebSocket proxying to that backend
+SERVE_EMU_BACKEND_ORIGIN=http://localhost:4319 bun run --filter serve-emu dev:ui
+```
+
+`SERVE_EMU_BACKEND_ORIGIN` only selects the Vite development proxy target. It
+does not disable the backend's token or same-origin protections; use the normal
+CLI access-control flags when exposing the backend beyond loopback.
+
+The repository-root `README.md` is the authoritative product documentation.
+After editing it, regenerate and verify the package copy:
+
+```sh
+bun run docs:sync
+bun run docs:check
+```
+
+For runtime or protocol changes, test with a booted emulator or device:
+
+```sh
+adb devices
+bun run packages/serve-emu/src/cli.ts
+```
+
+Useful manual checks include first video frame, browser refresh recovery, multiple tabs, tap/swipe/text/key input, screenshots, logcat SSE, app management, location, route playback, and session replay.
+
+## Package Rename
+
+The project and npm package are named `serve-emu` again, starting with version
+0.0.6. If you installed the temporary `serve-emul` package, switch to:
+
+```sh
+bunx serve-emu@latest
+# or: npx serve-emu@latest
+```
+
+For global installations, run `npm uninstall -g serve-emul` followed by
+`npm install -g serve-emu@latest`. The executable is now `serve-emu`.
+Development scripts use `packages/serve-emu` and `--filter serve-emu`.
+Environment variables use the `SERVE_EMU_` prefix.
+
+## Contributing
+
+See [`CONTRIBUTING.md`](https://github.com/jiunshinn/serve-emu/blob/main/CONTRIBUTING.md) for development setup, validation steps, scrcpy protocol notes, and pull request guidelines.
+
+## License
+
+Apache-2.0. Bundles the upstream [scrcpy](https://github.com/Genymobile/scrcpy) server binary (Apache-2.0) at runtime.
